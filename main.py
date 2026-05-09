@@ -96,7 +96,38 @@ async def ingest(request: IngestRequest):
 
 @app.post("/query/stream")
 async def query_stream(request: QueryRequest):
+    """Chat with the robot.
+
+    Default backend = MCP-aware Bedrock agent (Claude Sonnet 4.6 + dimos MCP
+    tools at localhost:9990). Falls back to the local semantic-map agent
+    only if the MCP backend errors at import-time.
+    """
     store: WorldStateStore = app.state.world_store
+
+    use_mcp = os.environ.get("USE_MCP_AGENT", "true").lower() == "true"
+
+    if use_mcp:
+        try:
+            from agent_mcp import run_mcp_agent_stream
+
+            def generate_mcp():
+                try:
+                    for token in run_mcp_agent_stream(request.text):
+                        yield f"data: {json.dumps(token)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    logger.exception("MCP agent stream error")
+                    yield f"data: {json.dumps(f'Error: {e}')}\n\n"
+                    yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                generate_mcp(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        except ImportError as e:
+            logger.warning(f"MCP agent unavailable, using fallback: {e}")
+
     try:
         from agent import run_agent_stream
     except ImportError:
@@ -354,10 +385,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .section-title { font-size: 10px; font-weight: 700; color: #4fc3f7;
                      letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 6px; }
 
-    #chat { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 0; }
-    .msg { margin-bottom: 6px; font-size: 12px; line-height: 1.5; }
-    .msg-user b { color: #80cbc4; }
-    .msg-robot b { color: #b0bec5; }
+    #chat { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 0;
+            display: flex; flex-direction: column; gap: 6px; }
+    .msg { font-size: 12px; line-height: 1.5; padding: 7px 10px; border-radius: 10px;
+           max-width: 88%; word-wrap: break-word; }
+    .msg b { display: block; font-size: 10px; letter-spacing: 0.05em;
+             text-transform: uppercase; margin-bottom: 2px; opacity: 0.8; }
+    /* User: cyan bubble, right-aligned */
+    .msg-user { align-self: flex-end; background: #0d3b66; color: #e8f4fd;
+                border: 1px solid #1565c0; }
+    .msg-user b { color: #4fc3f7; }
+    /* Robot: green-ish bubble, left-aligned */
+    .msg-robot { align-self: flex-start; background: #1a2e1f; color: #d8f3dc;
+                 border: 1px solid #2d5a3d; }
+    .msg-robot b { color: #81c784; }
+    /* Preserve agent newlines */
+    .msg span { white-space: pre-wrap; }
+    /* Tool-use lines like [→ navigate_with_text({...})] rendered dim/orange */
+    .msg-robot .tool {
+        display: block; font-size: 10px; color: #ffb74d; font-style: italic;
+        padding: 2px 0; opacity: 0.85;
+    }
     #chat-input-row { display: flex; gap: 6px; padding: 8px 10px;
                       border-top: 1px solid #1e2d3d; flex-shrink: 0; }
     #q { flex: 1; padding: 7px 10px; background: #0d1117; border: 1px solid #2a3a4a;
@@ -433,31 +481,69 @@ window._chat = async function() {
   _msg('You', q, 'msg-user');
   inp.value = '';
   const el = _msg('Go2', '', 'msg-robot');
+  const span = el.querySelector('span');
+  let buffer = '';   // accumulates plain text waiting to be flushed
+  function flushText() {
+    if (buffer) {
+      span.appendChild(document.createTextNode(buffer));
+      buffer = '';
+    }
+  }
+  function appendChunk(s) {
+    // Pull out [→ tool(...)] lines and render them as orange italic blocks.
+    const re = /\\[→ [^\\]]*\\]/g;
+    let last = 0, m;
+    while ((m = re.exec(s)) !== null) {
+      buffer += s.slice(last, m.index);
+      flushText();
+      const tool = document.createElement('span');
+      tool.className = 'tool';
+      tool.textContent = m[0];
+      span.appendChild(tool);
+      last = m.index + m[0].length;
+    }
+    buffer += s.slice(last);
+    flushText();
+  }
   try {
     const resp = await fetch('/query/stream', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({text: q})
     });
     const reader = resp.body.getReader(), dec = new TextDecoder();
+    let leftover = '';
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
-      for (const line of dec.decode(value).split('\\n')) {
+      const chunk = leftover + dec.decode(value, {stream: true});
+      const lines = chunk.split('\\n');
+      leftover = lines.pop() || '';   // last partial line carries over
+      for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const tok = line.slice(6);
-        if (tok === '[DONE]') break;
-        try { el.querySelector('span').innerHTML += JSON.parse(tok); } catch(e) {}
-        document.getElementById('chat').scrollTop = 99999;
+        if (tok === '[DONE]') return;
+        try {
+          appendChunk(JSON.parse(tok));
+          document.getElementById('chat').scrollTop = 99999;
+        } catch(e) {}
       }
     }
-  } catch(e) { el.querySelector('span').textContent += ' [error]'; }
+  } catch(e) {
+    span.appendChild(document.createTextNode(' [error: ' + e.message + ']'));
+  }
 };
 function _msg(who, text, cls) {
   const chat = document.getElementById('chat');
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
-  d.innerHTML = '<b>' + who + ':</b> <span>' + text + '</span>';
-  chat.appendChild(d); chat.scrollTop = 99999; return d;
+  const b = document.createElement('b');
+  b.textContent = who;
+  const s = document.createElement('span');
+  s.textContent = text;
+  d.appendChild(b);
+  d.appendChild(s);
+  chat.appendChild(d); chat.scrollTop = 99999;
+  return d;
 }
 
 window._mic = (function() {
