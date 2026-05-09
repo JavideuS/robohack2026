@@ -266,28 +266,24 @@ async def stream_frames(robot_id: str):
     )
 
 
-# ── Navigation via WebSocket (no MCP needed) ─────────────────
+# ── Navigation — goal queue (robot polls and forwards to DimOS) ─
 
-DIMOS_WS_URL = os.environ.get("DIMOS_WS_URL", "ws://localhost:7779")
+_goal_queue: list[dict] = []
 
 
 @app.post("/navigate")
 async def navigate_to_point(x: float, y: float, z: float = 0.0):
-    """
-    Send a navigation goal to DimOS via WebSocket.
-    Click-to-navigate from the dashboard.
-    """
-    try:
-        from ws_bridge import send_goal_via_ws
-        ok = await send_goal_via_ws(DIMOS_WS_URL, x, y, z)
-        if ok:
-            return {"status": "goal_sent", "target": {"x": x, "y": y, "z": z}}
-        else:
-            raise HTTPException(503, "Failed to send goal to DimOS")
-    except ImportError:
-        raise HTTPException(503, "websockets not installed")
-    except Exception as e:
-        raise HTTPException(503, f"Navigation error: {e}")
+    """Queue a navigation goal — ws_bridge polls /goals/pending and forwards to DimOS."""
+    _goal_queue.append({"x": x, "y": y, "z": z, "ts": time.time()})
+    return {"status": "queued", "target": {"x": x, "y": y, "z": z}}
+
+
+@app.get("/goals/pending")
+async def get_pending_goals():
+    """ws_bridge calls this to drain and forward queued goals to DimOS."""
+    goals = list(_goal_queue)
+    _goal_queue.clear()
+    return {"goals": goals}
 
 
 # ── Map Endpoint ──────────────────────────────────────────────
@@ -425,6 +421,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="chat-input-row">
       <input id="q" placeholder="Where is the chair?" onkeydown="if(event.key==='Enter')send()">
       <button id="send-btn" onclick="send()">Ask</button>
+    </div>
+    <div class="section">
+      <div class="section-title">Camera</div>
+      <img id="cam-img" src="/frames/go2_a/stream"
+           style="width:100%;border-radius:6px;background:#0d1117;min-height:80px;display:block"
+           onerror="this.style.opacity='0.3'" alt="No feed">
     </div>
     <div class="section" id="obj-section">
       <div class="section-title">Detected objects</div>

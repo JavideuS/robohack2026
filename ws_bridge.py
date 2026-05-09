@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -421,15 +422,34 @@ def _raw_image_to_jpeg(img_data: dict) -> bytes | None:
 
 # ── Main ──────────────────────────────────────────────────────
 
+async def poll_goals(cloud_url: str, ws_url: str):
+    """Poll EC2 for queued navigation goals and forward them to DimOS."""
+    while True:
+        try:
+            resp = httpx.get(f"{cloud_url}/goals/pending", timeout=2.0)
+            if resp.status_code == 200:
+                for goal in resp.json().get("goals", []):
+                    logger.info(f"Forwarding goal from cloud: ({goal['x']:.2f}, {goal['y']:.2f})")
+                    await send_goal_via_ws(ws_url, goal["x"], goal["y"])
+        except (httpx.ConnectError, httpx.TimeoutException):
+            pass
+        except Exception as e:
+            logger.debug(f"Goal poll error: {e}")
+        await asyncio.sleep(1.0)
+
+
 async def main_async(args):
     state = RobotState()
 
-    await listen_dimos_ws(
-        ws_url=args.ws_url,
-        state=state,
-        cloud_url=args.cloud_url,
-        robot_id=args.robot_id,
-        push_interval=args.interval,
+    await asyncio.gather(
+        listen_dimos_ws(
+            ws_url=args.ws_url,
+            state=state,
+            cloud_url=args.cloud_url,
+            robot_id=args.robot_id,
+            push_interval=args.interval,
+        ),
+        poll_goals(args.cloud_url, args.ws_url),
     )
 
 
@@ -442,8 +462,9 @@ def main():
         help="DimOS Socket.IO URL (default: http://localhost:7779)"
     )
     parser.add_argument(
-        "--cloud-url", default="http://localhost:8080",
-        help="Cloud FastAPI server URL (default: http://localhost:8080)"
+        "--cloud-url",
+        default=os.environ.get("CLOUD_URL", "http://localhost:8080"),
+        help="Cloud FastAPI server URL (default: $CLOUD_URL or http://localhost:8080)"
     )
     parser.add_argument(
         "--robot-id", default="go2_a",
