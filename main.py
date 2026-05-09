@@ -11,6 +11,7 @@ Endpoints:
 
 import base64
 import os
+import struct
 import time
 import json
 import logging
@@ -225,6 +226,45 @@ async def stream_frames(robot_id: str):
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
+# ── LiDAR Point Cloud ─────────────────────────────────────────
+# lidar_bridge.py POSTs zlib-compressed int16 triplets (x_cm, y_cm, z_cm).
+# We decompress, re-encode as base64, and serve to the dashboard.
+
+_live_pc: dict[str, dict] = {}  # robot_id → {b64, n, z_min, z_max, timestamp}
+
+
+@app.post("/ingest/pointcloud")
+async def ingest_pointcloud(request: Request):
+    robot_id = request.headers.get("X-Robot-Id", "go2_a")
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "Empty payload")
+    try:
+        raw = zlib.decompress(body)
+        n = struct.unpack_from("<i", raw)[0]
+        pts_bytes = raw[4:]  # N × 6 bytes of int16 triplets
+        # Compute z range for the dashboard colour mapper
+        z_vals = [
+            struct.unpack_from("<h", pts_bytes, i * 6 + 4)[0]
+            for i in range(n)
+        ]
+        _live_pc[robot_id] = {
+            "b64": base64.b64encode(pts_bytes).decode(),
+            "n": n,
+            "z_min": min(z_vals) if z_vals else 0,
+            "z_max": max(z_vals) if z_vals else 0,
+            "timestamp": time.time(),
+        }
+    except Exception as e:
+        raise HTTPException(400, f"Decode error: {e}")
+    return {"status": "ok", "robot_id": robot_id, "n": _live_pc[robot_id]["n"]}
+
+
+@app.get("/pointcloud/live")
+async def get_live_pointcloud():
+    return _live_pc
+
+
 # ── Navigation — goal queue ───────────────────────────────────
 
 _goal_queue: list[dict] = []
@@ -326,6 +366,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     #send-btn { padding: 7px 12px; background: #1565c0; border: none; border-radius: 6px;
                 color: #fff; cursor: pointer; font-weight: 600; font-size: 12px; }
     #send-btn:hover { background: #1976d2; }
+    #mic-btn { padding: 7px 10px; background: #1a2a3a; border: 1px solid #2a3a4a;
+               border-radius: 6px; color: #4fc3f7; cursor: pointer; font-size: 14px;
+               transition: background 0.2s, color 0.2s; flex-shrink: 0; }
+    #mic-btn:hover { background: #1e3a4a; }
+    #mic-btn.listening { background: #7f1d1d; border-color: #ef4444; color: #fca5a5;
+                         animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
 
     #cam-img { width: 100%; display: block; border-radius: 4px; background: #0a0e14;
                min-height: 60px; max-height: 110px; object-fit: cover; }
@@ -357,6 +404,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="chat-input-row">
       <input id="q" placeholder="Where is the chair?"
              onkeydown="if(event.key==='Enter')window._chat()">
+      <button id="mic-btn" onclick="window._mic()" title="Voice input">🎤</button>
       <button id="send-btn" onclick="window._chat()">Ask</button>
     </div>
     <div class="section">
@@ -411,6 +459,39 @@ function _msg(who, text, cls) {
   d.innerHTML = '<b>' + who + ':</b> <span>' + text + '</span>';
   chat.appendChild(d); chat.scrollTop = 99999; return d;
 }
+
+window._mic = (function() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return function() {
+    alert('Voice input requires Chrome or Edge.');
+  };
+  const rec = new SR();
+  rec.lang = 'en-US';
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  let active = false;
+
+  rec.onresult = function(e) {
+    const text = e.results[0][0].transcript;
+    document.getElementById('q').value = text;
+    window._chat();
+  };
+  rec.onend = function() {
+    active = false;
+    document.getElementById('mic-btn').classList.remove('listening');
+  };
+  rec.onerror = function() {
+    active = false;
+    document.getElementById('mic-btn').classList.remove('listening');
+  };
+
+  return function() {
+    if (active) { rec.stop(); return; }
+    active = true;
+    document.getElementById('mic-btn').classList.add('listening');
+    rec.start();
+  };
+})();
 </script>
 
 <script type="module">
@@ -452,13 +533,16 @@ renderer.domElement.addEventListener('pointerdown', () => {
 });
 
 // ── Lights ────────────────────────────────────────────────────
-scene.add(new THREE.HemisphereLight(0x223355, 0x080c10, 2.5));
-const sun = new THREE.DirectionalLight(0x99aacc, 3.5);
+scene.add(new THREE.HemisphereLight(0x334d66, 0x0a1020, 4.5));
+const sun = new THREE.DirectionalLight(0xbbd0ee, 6.5);
 sun.position.set(20, 40, 25);
 scene.add(sun);
-const fill = new THREE.DirectionalLight(0x334466, 0.5);
-fill.position.set(-15, -5, -15);
+const fill = new THREE.DirectionalLight(0x4466aa, 2.0);
+fill.position.set(-15, 10, -15);
 scene.add(fill);
+const rim = new THREE.DirectionalLight(0x4fc3f7, 1.5);
+rim.position.set(0, -8, 20);
+scene.add(rim);
 
 // ── Floor & grid ──────────────────────────────────────────────
 const floor = new THREE.Mesh(
@@ -468,33 +552,78 @@ const floor = new THREE.Mesh(
 floor.rotation.x = -Math.PI / 2;
 floor.position.y = -0.002;
 scene.add(floor);
-scene.add(new THREE.GridHelper(400, 400, 0x111d2a, 0x0e1824));
+scene.add(new THREE.GridHelper(400, 400, 0x1c3550, 0x152840));
 
-// ── Voxel InstancedMesh ───────────────────────────────────────
+// ── Voxel / Point-cloud renderer ─────────────────────────────
 const MAX_V = 80000;
-const WALL_H = 0.35;
-const GRAD_H = 0.12;
-
 const unitBox = new THREE.BoxGeometry(1, 1, 1);
 
+// Occupied cells → solid columns; MeshBasicMaterial = colors are lighting-independent
 const wallMesh = new THREE.InstancedMesh(
   unitBox,
-  new THREE.MeshStandardMaterial({ color: 0x2a3a52, roughness: 0.55, metalness: 0.45 }),
+  new THREE.MeshBasicMaterial({ vertexColors: true }),
   MAX_V
 );
 wallMesh.count = 0;
 scene.add(wallMesh);
 
-const gradMesh = new THREE.InstancedMesh(
-  unitBox,
-  new THREE.MeshStandardMaterial({ color: 0xc05318, roughness: 0.8, transparent: true, opacity: 0.5 }),
-  MAX_V
-);
-gradMesh.count = 0;
-scene.add(gradMesh);
+// Soft circular sprite texture — makes points render as glowing spheres, not squares
+function makeSpriteTex() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0,   'rgba(255,255,255,1.0)');
+  g.addColorStop(0.45,'rgba(255,255,255,0.9)');
+  g.addColorStop(1,   'rgba(255,255,255,0.0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+
+// Gradient / inflation zone → point cloud (see-through, no lighting needed)
+const gradGeo = new THREE.BufferGeometry();
+const gradPts = new THREE.Points(gradGeo, new THREE.PointsMaterial({
+  size: 0.13,
+  sizeAttenuation: true,
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.92,
+  map: makeSpriteTex(),
+  alphaTest: 0.04,
+  depthWrite: false,
+}));
+scene.add(gradPts);
 
 const dummy = new THREE.Object3D();
 let lastV = -1, cameraFitted = false;
+
+// ── Color palettes ────────────────────────────────────────────
+// Gradient zone — 5-stop turbo-like: every stop is perceptually bright, no near-black
+const _GC = [
+  new THREE.Color(0x4040ff), // vivid blue       (lowest cost)
+  new THREE.Color(0x00d4ff), // cyan
+  new THREE.Color(0x39ff14), // neon green
+  new THREE.Color(0xffd000), // amber
+  new THREE.Color(0xff3300), // red-orange        (highest cost)
+];
+function gradColor(v) {
+  const t = Math.min(1, Math.max(0, (v - 5) / 84)) * (_GC.length - 1);
+  const i = Math.min(_GC.length - 2, Math.floor(t));
+  return new THREE.Color().lerpColors(_GC[i], _GC[i + 1], t - i);
+}
+
+// Wall zone — hot-white: clearly distinct from the point cloud, reads as "solid obstacle"
+const _WC = [
+  new THREE.Color(0xffee00), // yellow       (v=90, softest obstacle)
+  new THREE.Color(0xffffff), // white        (v=95)
+  new THREE.Color(0xff88cc), // pink-white   (v=100, hardest obstacle)
+];
+function wallColor(v) {
+  const t = Math.min(1, (v - 90) / 10) * (_WC.length - 1);
+  const i = Math.min(_WC.length - 2, Math.floor(t));
+  return new THREE.Color().lerpColors(_WC[i], _WC[i + 1], t - i);
+}
 
 function b64ToUint8(b64) {
   const bin = atob(b64);
@@ -515,41 +644,50 @@ function rebuildVoxels(cm) {
   const ox = oc.c ? oc.c[0] : 0;
   const oy = oc.c ? oc.c[1] : 0;
 
-  let wc = 0, gc = 0;
+  let wc = 0;
+  const gPos = [], gCol = [];
+
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const v = flat[r * cols + c];
       const wx = ox + (c + 0.5) * res;
       const wy = oy + (r + 0.5) * res;
+
       if (v >= 90 && v !== 255) {
+        // Solid column — height encodes occupancy strength (0.35 → 1.2 m)
         if (wc < MAX_V) {
-          dummy.position.set(wx, WALL_H * 0.5, -wy);
-          dummy.scale.set(res, WALL_H, res);
-          dummy.updateMatrix();
-          wallMesh.setMatrixAt(wc++, dummy.matrix);
-        }
-      } else if (v > 5 && v < 90) {
-        if (gc < MAX_V) {
-          const h = GRAD_H * (v / 89);
+          const h = 0.35 + (v - 90) * 0.085;
           dummy.position.set(wx, h * 0.5, -wy);
           dummy.scale.set(res, h, res);
           dummy.updateMatrix();
-          gradMesh.setMatrixAt(gc++, dummy.matrix);
+          wallMesh.setMatrixAt(wc, dummy.matrix);
+          wallMesh.setColorAt(wc, wallColor(v));
+          wc++;
         }
+      } else if (v > 5 && v < 90) {
+        // Point cloud — height encodes cost (0.04 → 0.46 m), color viridis gradient
+        const h = 0.04 + (v / 89) * 0.42;
+        const col = gradColor(v);
+        gPos.push(wx, h, -wy);
+        gCol.push(col.r, col.g, col.b);
       }
     }
   }
-  wallMesh.count = wc; gradMesh.count = gc;
-  wallMesh.instanceMatrix.needsUpdate = true;
-  gradMesh.instanceMatrix.needsUpdate = true;
 
-  if (!cameraFitted) {
+  wallMesh.count = wc;
+  wallMesh.instanceMatrix.needsUpdate = true;
+  if (wallMesh.instanceColor) wallMesh.instanceColor.needsUpdate = true;
+
+  gradGeo.setAttribute('position', new THREE.Float32BufferAttribute(gPos, 3));
+  gradGeo.setAttribute('color',    new THREE.Float32BufferAttribute(gCol, 3));
+
+  if (!cameraFitted && (wc > 0 || gPos.length > 0)) {
     cameraFitted = true;
     const mx = ox + cols * res / 2;
     const my = oy + rows * res / 2;
     const span = Math.max(cols, rows) * res;
-    controls.target.set(mx, 0, -my);
-    camera.position.set(mx, span * 0.65, -my + span * 0.8);
+    controls.target.set(mx, 0.3, -my);
+    camera.position.set(mx, span * 0.7, -my + span * 0.9);
     controls.update();
   }
 }
@@ -583,13 +721,14 @@ robotGrp.add(ringMesh);
 robotGrp.visible = false;
 scene.add(robotGrp);
 
+let _robotX = 0, _robotY = 0;
 function updateRobot(rp) {
   if (!rp || !rp.c) return;
-  const x = rp.c[0], y = rp.c[1], theta = rp.c[2] || 0;
-  robotGrp.position.set(x, 0.18, -y);
+  _robotX = rp.c[0]; _robotY = rp.c[1];
+  const theta = rp.c[2] || 0;
   robotGrp.rotation.y = -theta;
   robotGrp.visible = true;
-  document.getElementById('robot-pos').textContent = '(' + x.toFixed(2) + ', ' + y.toFixed(2) + ')';
+  document.getElementById('robot-pos').textContent = '(' + _robotX.toFixed(2) + ', ' + _robotY.toFixed(2) + ')';
 }
 
 // ── Path ──────────────────────────────────────────────────────
@@ -603,7 +742,7 @@ scene.add(pathLine);
 function updatePath(pd) {
   if (!pd || !pd.points || !pd.points.length) { pathGeo.setFromPoints([]); return; }
   pathGeo.setFromPoints(pd.points.map(function(p) {
-    return new THREE.Vector3(p[0], 0.05, -p[1]);
+    return new THREE.Vector3(p[0], 0.12, -p[1]);
   }));
 }
 
@@ -685,6 +824,75 @@ function _showNav(msg, err) {
   el._t = setTimeout(function() { el.classList.remove('show'); }, 3000);
 }
 
+// ── LiDAR point cloud renderer ───────────────────────────────
+const lidarGeo = new THREE.BufferGeometry();
+const lidarPts = new THREE.Points(lidarGeo, new THREE.PointsMaterial({
+  size: 0.12,
+  sizeAttenuation: true,
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.92,
+  map: makeSpriteTex(),
+  alphaTest: 0.04,
+  depthWrite: false,
+}));
+scene.add(lidarPts);
+
+// Turbo-like 5-stop palette for height: blue → cyan → green → amber → red
+const _LC = [
+  new THREE.Color(0x4040ff),
+  new THREE.Color(0x00d4ff),
+  new THREE.Color(0x39ff14),
+  new THREE.Color(0xffd000),
+  new THREE.Color(0xff3300),
+];
+function lidarColor(t) {
+  const s = Math.min(1, Math.max(0, t)) * (_LC.length - 1);
+  const i = Math.min(_LC.length - 2, Math.floor(s));
+  return new THREE.Color().lerpColors(_LC[i], _LC[i + 1], s - i);
+}
+
+let _lastPcTs = 0;
+function updateLidar(data) {
+  // data: {b64, n, z_min, z_max, timestamp} from /pointcloud/live
+  if (!data || data.timestamp === _lastPcTs) return;
+  _lastPcTs = data.timestamp;
+
+  const n    = data.n;
+  const zMin = data.z_min;  // int16 cm
+  const zMax = data.z_max;
+  const zRng = Math.max(1, zMax - zMin);
+
+  // Decode base64 → signed Int16Array (little-endian, matches Python struct '<hhh')
+  const bin = atob(data.b64);
+  const ab  = new ArrayBuffer(bin.length);
+  const u8v = new Uint8Array(ab);
+  for (let i = 0; i < bin.length; i++) u8v[i] = bin.charCodeAt(i);
+  const i16 = new Int16Array(ab);
+
+  const pos = new Float32Array(n * 3);
+  const col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const xM =  i16[i * 3]     / 100;
+    const yM =  i16[i * 3 + 1] / 100;
+    const zCm = i16[i * 3 + 2];
+    const zM  = zCm / 100;
+    pos[i * 3]     = xM;
+    pos[i * 3 + 1] = zM;   // z → Three.js Y (height)
+    pos[i * 3 + 2] = -yM;  // y → Three.js -Z
+    const c = lidarColor((zCm - zMin) / zRng);
+    col[i * 3]     = c.r;
+    col[i * 3 + 1] = c.g;
+    col[i * 3 + 2] = c.b;
+  }
+
+  lidarGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  lidarGeo.setAttribute('color',    new THREE.Float32BufferAttribute(col, 3));
+
+  // When real LiDAR is flowing, hide the costmap gradient cloud (less clutter)
+  gradPts.visible = false;
+}
+
 // ── Polling ───────────────────────────────────────────────────
 let lastTs = 0;
 
@@ -708,9 +916,18 @@ async function pollSem() {
   } catch(e) {}
 }
 
-setInterval(pollLive, 500);
-setInterval(pollSem, 2000);
-pollLive(); pollSem();
+async function pollPointcloud() {
+  try {
+    const d = await (await fetch('/pointcloud/live')).json();
+    const entry = d['go2_a'] || Object.values(d)[0];
+    if (entry) updateLidar(entry);
+  } catch(e) {}
+}
+
+setInterval(pollLive,       500);
+setInterval(pollSem,       2000);
+setInterval(pollPointcloud, 800);
+pollLive(); pollSem(); pollPointcloud();
 
 // ── Resize ────────────────────────────────────────────────────
 window.addEventListener('resize', function() {
@@ -723,6 +940,14 @@ window.addEventListener('resize', function() {
 (function animate() {
   requestAnimationFrame(animate);
   controls.update();
+
+  if (robotGrp.visible) {
+    const t = Date.now() * 0.001;
+    robotGrp.position.set(_robotX, 0.22 + Math.sin(t * 2.1) * 0.05, -_robotY);
+    ringMesh.material.opacity = 0.18 + Math.sin(t * 2.8) * 0.12;
+    ringMesh.scale.setScalar(1.0 + Math.sin(t * 1.6) * 0.18);
+  }
+
   renderer.render(scene, camera);
 })();
 </script>
