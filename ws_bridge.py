@@ -35,6 +35,14 @@ try:
 except ImportError:
     HAS_SOCKETIO = False
 
+try:
+    from dimos.core.transport import pSHMTransport
+    from dimos.msgs.sensor_msgs.Image import Image as DimosImage, ImageFormat
+    import cv2
+    HAS_DIMOS_SHM = True
+except ImportError:
+    HAS_DIMOS_SHM = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(message)s",
@@ -420,6 +428,72 @@ def _raw_image_to_jpeg(img_data: dict) -> bytes | None:
         return None
 
 
+# ── Camera via DimOS pSHM ─────────────────────────────────────
+
+_cam_last_push = 0.0
+_CAM_MIN_INTERVAL = 0.2  # 5 fps max
+
+
+async def stream_camera_from_shm(cloud_url: str, robot_id: str, topic: str = "color_image"):
+    """
+    Subscribe to DimOS color_image pSHM channel and forward JPEG frames to cloud.
+    Only active when the dimos package is importable (i.e., running in dimos venv).
+    """
+    if not HAS_DIMOS_SHM:
+        logger.debug("DimOS SHM not available — camera stream disabled")
+        return
+
+    global _cam_last_push
+    transport = pSHMTransport(topic)
+    latest: list = [None]  # mutable holder for latest frame
+
+    def _on_frame(img):
+        latest[0] = img
+
+    try:
+        transport.subscribe(_on_frame)  # subscribe() calls start() internally
+        logger.info(f"Camera SHM subscriber started (topic={topic})")
+    except Exception as e:
+        logger.warning(f"Camera SHM subscribe failed: {e}")
+        return
+
+    try:
+        while True:
+            img = latest[0]
+            if img is not None:
+                now = time.time()
+                if now - _cam_last_push >= _CAM_MIN_INTERVAL:
+                    _cam_last_push = now
+                    latest[0] = None
+                    try:
+                        arr = img.data  # numpy array, BGR format
+                        if img.format == ImageFormat.RGB:
+                            arr = arr[:, :, ::-1]  # RGB→BGR for cv2
+                        ok, buf = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                        if ok:
+                            frame_bytes = buf.tobytes()
+                            try:
+                                httpx.post(
+                                    f"{cloud_url}/frames",
+                                    content=frame_bytes,
+                                    headers={
+                                        "Content-Type": "image/jpeg",
+                                        "X-Robot-Id": robot_id,
+                                    },
+                                    timeout=1.0,
+                                )
+                            except (httpx.ConnectError, httpx.TimeoutException):
+                                pass
+                    except Exception as e:
+                        logger.debug(f"Camera frame encode error: {e}")
+            await asyncio.sleep(0.05)
+    finally:
+        try:
+            transport.stop()
+        except Exception:
+            pass
+
+
 # ── Main ──────────────────────────────────────────────────────
 
 async def poll_goals(cloud_url: str, ws_url: str):
@@ -441,7 +515,7 @@ async def poll_goals(cloud_url: str, ws_url: str):
 async def main_async(args):
     state = RobotState()
 
-    await asyncio.gather(
+    tasks = [
         listen_dimos_ws(
             ws_url=args.ws_url,
             state=state,
@@ -450,7 +524,9 @@ async def main_async(args):
             push_interval=args.interval,
         ),
         poll_goals(args.cloud_url, args.ws_url),
-    )
+        stream_camera_from_shm(args.cloud_url, args.robot_id),
+    ]
+    await asyncio.gather(*tasks)
 
 
 def main():
