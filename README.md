@@ -18,6 +18,7 @@ FastAPI server that bridges a Unitree Go2 robot (running DimOS) to a live web da
 |---|---|
 | `main.py` | FastAPI server — all endpoints + dashboard HTML |
 | `ws_bridge.py` | Connects to DimOS Socket.IO (port 7779), relays costmap/path/pose to cloud |
+| `camera_bridge.py` | Camera frame pusher — auto-detects source (DimOS pSHM / RTSP / USB) |
 | `dimos_bridge.py` | Reads DimOS MCP perception tools, pushes detected objects to cloud |
 | `cloud_client.py` | `CloudClient` class — reusable push client for robot-side integration |
 | `agent.py` | AWS Bedrock agent loop — natural language queries over the semantic map |
@@ -50,6 +51,35 @@ screen -S fastapi
 uvicorn main:app --host 0.0.0.0 --port 8080
 # Ctrl+A D to detach
 ```
+
+## Camera stream
+
+`camera_bridge.py` pushes frames to `/frames` so the dashboard shows live video.
+
+**DimOS transport is platform-dependent:**
+- **Linux** → `LCMTransport` (UDP multicast) — confirmed working
+- **Mac** → `pSHMTransport` (shared memory) — `--source dimos` falls back to pSHM
+
+Must run inside the dimos venv (`source dimos/.venv/bin/activate`) for `--source dimos`.
+
+```bash
+# Auto-detect (LCM/pSHM → RTSP → USB webcam):
+python camera_bridge.py
+
+# DimOS simulation (Linux: LCM multicast, Mac: pSHM):
+python camera_bridge.py --source dimos
+
+# Real Go2 over network:
+python camera_bridge.py --source rtsp --rtsp-url rtsp://192.168.123.161:8554/video
+
+# USB webcam — no DimOS needed, good for testing:
+python camera_bridge.py --source opencv --device 0
+
+# Push to EC2:
+python camera_bridge.py --cloud-url http://<ec2-ip>:8080
+```
+
+Stream visible at `/frames/go2_a/stream` (MJPEG) and `/frames/go2_a` (latest JPEG).
 
 ## Run the bridge (laptop, with DimOS running)
 
