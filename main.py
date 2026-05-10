@@ -16,6 +16,7 @@ import time
 import json
 import logging
 import zlib
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -43,9 +44,64 @@ USE_MEMORY_STORE = os.environ.get("USE_MEMORY_STORE", "true").lower() == "true"
 # AUTO_BRIDGES=false to disable, e.g. when running the cloud UI on EC2.
 AUTO_BRIDGES = os.environ.get("AUTO_BRIDGES", "true").lower() == "true"
 CAMERA_BRIDGE_FPS = os.environ.get("CAMERA_BRIDGE_FPS", "10")
+CAMERA_BRIDGE_SOURCE = os.environ.get("CAMERA_BRIDGE_SOURCE", "auto")
+CAMERA_HTTP_URL = os.environ.get("CAMERA_HTTP_URL", "http://192.168.123.18:8888/frame")
+CAMERA_PUBLISH_LCM = os.environ.get("CAMERA_PUBLISH_LCM", "true")
 SELF_URL = os.environ.get("SELF_URL", "http://localhost:8080")
 PC_ACCUM_VOXEL_CM = max(1, int(os.environ.get("PC_ACCUM_VOXEL_CM", "8")))
 PC_ACCUM_MAX_POINTS = max(1000, int(os.environ.get("PC_ACCUM_MAX_POINTS", "120000")))
+PC_OBS_RADIUS_CM = max(0, int(os.environ.get("PC_OBS_RADIUS_CM", "20")))
+PC_HIT_SCORE = float(os.environ.get("PC_HIT_SCORE", "1.0"))
+PC_MAX_SCORE = float(os.environ.get("PC_MAX_SCORE", "8.0"))
+PC_MISS_DECAY = float(os.environ.get("PC_MISS_DECAY", "0.72"))
+PC_TIME_DECAY_PER_SEC = float(os.environ.get("PC_TIME_DECAY_PER_SEC", "0.015"))
+PC_RENDER_SCORE = float(os.environ.get("PC_RENDER_SCORE", "1.2"))
+PC_DELETE_SCORE = float(os.environ.get("PC_DELETE_SCORE", "0.35"))
+AWS_TRANSCRIBE_LANGUAGE = os.environ.get("AWS_TRANSCRIBE_LANGUAGE", "en-US")
+AWS_TRANSCRIBE_TIMEOUT = float(os.environ.get("AWS_TRANSCRIBE_TIMEOUT", "45"))
+SPEECH_S3_PREFIX = os.environ.get("SPEECH_S3_PREFIX", "speech")
+
+
+def _load_aws_env_from_dimos() -> None:
+    """Load AWS credentials from the sibling DimOS .env when not already set."""
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return
+    candidates = [
+        os.path.expanduser("~/robohack-epfl/dimos/.env"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dimos", ".env"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key.startswith("AWS_") or key in {"S3_BUCKET"}:
+                        os.environ.setdefault(key, val)
+            return
+        except Exception as exc:
+            logger.debug("Could not load AWS env from %s: %s", path, exc)
+
+
+def _audio_format_from_content_type(content_type: str) -> tuple[str, str]:
+    ct = (content_type or "").lower()
+    if "webm" in ct:
+        return "webm", "audio/webm"
+    if "mp4" in ct or "m4a" in ct:
+        return "mp4", "audio/mp4"
+    if "mpeg" in ct or "mp3" in ct:
+        return "mp3", "audio/mpeg"
+    if "ogg" in ct:
+        return "ogg", "audio/ogg"
+    if "wav" in ct or "wave" in ct:
+        return "wav", "audio/wav"
+    return "webm", "audio/webm"
 
 
 def _spawn_bridges() -> list:
@@ -66,7 +122,10 @@ def _spawn_bridges() -> list:
             "camera_bridge",
             [py, "-u", os.path.join(here, "camera_bridge.py"),
              "--cloud-url", SELF_URL,
-             "--fps", str(CAMERA_BRIDGE_FPS)],
+             "--fps", str(CAMERA_BRIDGE_FPS),
+             "--source", CAMERA_BRIDGE_SOURCE,
+             "--http-url", CAMERA_HTTP_URL,
+             "--publish-lcm" if CAMERA_PUBLISH_LCM.lower() == "true" else "--no-publish-lcm"],
         ),
         (
             "pc_bridge",
@@ -140,15 +199,94 @@ async def health():
     return {"status": "ok", "store": "memory" if USE_MEMORY_STORE else "s3"}
 
 
+# ── Speech-to-text (AWS Transcribe) ───────────────────────────
+
+@app.post("/speech/transcribe")
+async def transcribe_speech(request: Request):
+    """Transcribe a short browser-recorded audio clip via Amazon Transcribe.
+
+    The browser posts the audio blob directly. We upload it to S3 because
+    Transcribe batch jobs require an S3 media URI, then poll the short job and
+    return the text for the active Ask/Agent chat tab.
+    """
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(400, "empty audio body")
+
+    _load_aws_env_from_dimos()
+    bucket = os.environ.get("S3_BUCKET", S3_BUCKET)
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or AWS_REGION
+    lang = os.environ.get("AWS_TRANSCRIBE_LANGUAGE", AWS_TRANSCRIBE_LANGUAGE)
+    timeout = float(os.environ.get("AWS_TRANSCRIBE_TIMEOUT", str(AWS_TRANSCRIBE_TIMEOUT)))
+    fmt, content_type = _audio_format_from_content_type(
+        request.headers.get("content-type", "")
+    )
+
+    try:
+        import boto3
+        import httpx
+    except Exception as exc:
+        raise HTTPException(500, f"missing AWS transcription dependency: {exc}")
+
+    job = f"robohack-speech-{uuid.uuid4().hex}"
+    key = f"{SPEECH_S3_PREFIX}/{job}.{fmt}"
+    s3_uri = f"s3://{bucket}/{key}"
+
+    s3 = boto3.client("s3", region_name=region)
+    transcribe = boto3.client("transcribe", region_name=region)
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=audio, ContentType=content_type)
+        transcribe.start_transcription_job(
+            TranscriptionJobName=job,
+            Media={"MediaFileUri": s3_uri},
+            MediaFormat=fmt,
+            LanguageCode=lang,
+        )
+
+        deadline = time.time() + timeout
+        last_status = "QUEUED"
+        while time.time() < deadline:
+            info = transcribe.get_transcription_job(TranscriptionJobName=job)[
+                "TranscriptionJob"
+            ]
+            last_status = info["TranscriptionJobStatus"]
+            if last_status == "COMPLETED":
+                transcript_uri = info["Transcript"]["TranscriptFileUri"]
+                data = httpx.get(transcript_uri, timeout=10).json()
+                text = (data.get("results", {}).get("transcripts") or [{}])[0].get(
+                    "transcript", ""
+                )
+                return {"text": text, "job": job, "language": lang}
+            if last_status == "FAILED":
+                raise HTTPException(
+                    502,
+                    info.get("FailureReason", "Amazon Transcribe job failed"),
+                )
+            time.sleep(1.0)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"speech transcription failed: {exc}")
+    finally:
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+        except Exception:
+            pass
+
+    raise HTTPException(504, f"speech transcription timed out ({last_status})")
+
+
 # ── Robot Endpoints (Req 1: Ingestion) ────────────────────────
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(request: IngestRequest):
     store: WorldStateStore = app.state.world_store
+    previous = store.load(request.robot_id)
+    objects = _merge_detected_objects(previous.objects if previous else [], request.objects)
     state = WorldState(
         robot_id=request.robot_id,
         timestamp=time.time(),
-        objects=request.objects,
+        objects=objects,
     )
     try:
         store.save(state)
@@ -159,9 +297,38 @@ async def ingest(request: IngestRequest):
     return IngestResponse(
         status="saved",
         robot_id=request.robot_id,
-        count=len(request.objects),
+        count=len(objects),
         timestamp=state.timestamp,
     )
+
+
+def _merge_detected_objects(existing, incoming):
+    """Merge semantic detections instead of replacing the whole map each push."""
+    merged = [obj.model_copy(deep=True) for obj in existing]
+    for obj in incoming:
+        match = None
+        for prev in merged:
+            if prev.label.lower() != obj.label.lower():
+                continue
+            dx = prev.pose.x - obj.pose.x
+            dy = prev.pose.y - obj.pose.y
+            dz = prev.pose.z - obj.pose.z
+            if (dx * dx + dy * dy + dz * dz) ** 0.5 <= 1.0:
+                match = prev
+                break
+        if match is None:
+            merged.append(obj)
+            continue
+        old_n = max(1, match.seen_count)
+        new_n = old_n + max(1, obj.seen_count)
+        match.pose.x = (match.pose.x * old_n + obj.pose.x) / new_n
+        match.pose.y = (match.pose.y * old_n + obj.pose.y) / new_n
+        match.pose.z = (match.pose.z * old_n + obj.pose.z) / new_n
+        match.confidence = max(match.confidence, obj.confidence)
+        match.seen_count = new_n
+        match.last_seen = max(match.last_seen, obj.last_seen)
+        match.source = obj.source or match.source
+    return sorted(merged, key=lambda o: o.last_seen, reverse=True)[:200]
 
 
 # ── User Endpoints (Req 2: Query) ────────────────────────────
@@ -282,12 +449,16 @@ async def stream_frames(robot_id: str):
 # the explored area, not only the most recent scan.
 
 _live_pc: dict[str, dict] = {}  # robot_id -> {b64, n, z_min, z_max, timestamp}
-_pc_voxels: dict[str, dict[tuple[int, int, int], tuple[int, int, int]]] = {}
+_pc_voxels: dict[str, dict[tuple[int, int, int], dict]] = {}
 
 
 def _rebuild_accumulated_pointcloud(robot_id: str) -> None:
     voxels = _pc_voxels.get(robot_id, {})
-    pts = list(voxels.values())
+    pts = [
+        (v["x"], v["y"], v["z"])
+        for v in voxels.values()
+        if v.get("score", 0.0) >= PC_RENDER_SCORE
+    ]
     if not pts:
         _live_pc[robot_id] = {
             "b64": "",
@@ -296,6 +467,8 @@ def _rebuild_accumulated_pointcloud(robot_id: str) -> None:
             "z_max": 0,
             "timestamp": time.time(),
             "voxel_cm": PC_ACCUM_VOXEL_CM,
+            "obs_radius_cm": PC_OBS_RADIUS_CM,
+            "render_score": PC_RENDER_SCORE,
             "accumulated": True,
         }
         return
@@ -315,8 +488,96 @@ def _rebuild_accumulated_pointcloud(robot_id: str) -> None:
         "z_max": z_max,
         "timestamp": time.time(),
         "voxel_cm": PC_ACCUM_VOXEL_CM,
+        "obs_radius_cm": PC_OBS_RADIUS_CM,
+        "render_score": PC_RENDER_SCORE,
         "accumulated": True,
     }
+
+
+def _update_accumulated_voxels(
+    robot_id: str,
+    pts_bytes: bytes,
+    n: int,
+) -> None:
+    """Merge a fresh lidar scan into a confidence-weighted accumulated map.
+
+    Repeated hits increase a voxel's score and update its position by running
+    average. Missing voxels in the currently observed neighborhood decay instead
+    of being deleted immediately. This keeps stable structure visible while
+    allowing one-off false positives to fade after the robot looks there again.
+    """
+    voxels = _pc_voxels.setdefault(robot_id, {})
+    now = time.time()
+    step = PC_ACCUM_VOXEL_CM
+    obs_cells = max(0, round(PC_OBS_RADIUS_CM / step))
+    current: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    observed_xy: set[tuple[int, int]] = set()
+
+    for i in range(n):
+        x, y, z = struct.unpack_from("<hhh", pts_bytes, i * 6)
+        kx = round(x / step)
+        ky = round(y / step)
+        kz = round(z / step)
+        key = (kx, ky, kz)
+        current[key] = (x, y, z)
+        if obs_cells:
+            for dx in range(-obs_cells, obs_cells + 1):
+                for dy in range(-obs_cells, obs_cells + 1):
+                    observed_xy.add((kx + dx, ky + dy))
+        else:
+            observed_xy.add((kx, ky))
+
+    # Gentle global aging prevents old one-off artifacts from living forever.
+    for key, val in list(voxels.items()):
+        age = max(0.0, now - val.get("updated_at", now))
+        if age > 0:
+            val["score"] = max(0.0, val.get("score", 0.0) - age * PC_TIME_DECAY_PER_SEC)
+            val["updated_at"] = now
+
+    for key, (x, y, z) in current.items():
+        val = voxels.get(key)
+        if val is None:
+            voxels[key] = {
+                "x": x,
+                "y": y,
+                "z": z,
+                "score": PC_HIT_SCORE,
+                "hits": 1,
+                "updated_at": now,
+            }
+            continue
+
+        hits = val.get("hits", 1) + 1
+        alpha = min(0.35, 1.0 / hits)
+        val["x"] = round(val["x"] * (1.0 - alpha) + x * alpha)
+        val["y"] = round(val["y"] * (1.0 - alpha) + y * alpha)
+        val["z"] = round(val["z"] * (1.0 - alpha) + z * alpha)
+        val["hits"] = hits
+        val["score"] = min(PC_MAX_SCORE, val.get("score", 0.0) + PC_HIT_SCORE)
+        val["updated_at"] = now
+
+    # Stronger local decay: if the robot is actively observing this XY region
+    # and a stored voxel is not seen again, lower its confidence but do not
+    # erase it immediately. Consistent surfaces survive; false positives fade.
+    if observed_xy:
+        for key, val in list(voxels.items()):
+            if key not in current and (key[0], key[1]) in observed_xy:
+                val["score"] = val.get("score", 0.0) * PC_MISS_DECAY
+
+    for key, val in list(voxels.items()):
+        if val.get("score", 0.0) < PC_DELETE_SCORE:
+            del voxels[key]
+
+    # Bound memory and UI payload size. Dict order is insertion order; this
+    # drops the weakest/oldest voxels first.
+    overflow = len(voxels) - PC_ACCUM_MAX_POINTS
+    if overflow > 0:
+        drop = sorted(
+            voxels,
+            key=lambda k: (voxels[k].get("score", 0.0), voxels[k].get("updated_at", 0.0)),
+        )[:overflow]
+        for key in drop:
+            del voxels[key]
 
 
 @app.post("/ingest/pointcloud")
@@ -332,19 +593,7 @@ async def ingest_pointcloud(request: Request):
         if len(pts_bytes) < n * 6:
             raise ValueError(f"payload too short for {n} points")
 
-        voxels = _pc_voxels.setdefault(robot_id, {})
-        step = PC_ACCUM_VOXEL_CM
-        for i in range(n):
-            x, y, z = struct.unpack_from("<hhh", pts_bytes, i * 6)
-            key = (round(x / step), round(y / step), round(z / step))
-            voxels[key] = (x, y, z)
-
-        # Bound memory and UI payload size. Dict order is insertion order; this
-        # drops the oldest never-updated voxels first.
-        overflow = len(voxels) - PC_ACCUM_MAX_POINTS
-        for _ in range(max(0, overflow)):
-            voxels.pop(next(iter(voxels)))
-
+        _update_accumulated_voxels(robot_id, pts_bytes, n)
         _rebuild_accumulated_pointcloud(robot_id)
     except Exception as e:
         raise HTTPException(400, f"Decode error: {e}")
@@ -708,34 +957,86 @@ function _msg(paneId, who, text, cls) {
 
 window._mic = (function() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) return function() {
-    alert('Voice input requires Chrome or Edge.');
-  };
-  const rec = new SR();
-  rec.lang = 'en-US';
-  rec.interimResults = false;
-  rec.maxAlternatives = 1;
-  let active = false;
-
-  rec.onresult = function(e) {
-    const text = e.results[0][0].transcript;
-    document.getElementById('q').value = text;
-    window._chat();
-  };
-  rec.onend = function() {
-    active = false;
-    document.getElementById('mic-btn').classList.remove('listening');
-  };
-  rec.onerror = function() {
-    active = false;
-    document.getElementById('mic-btn').classList.remove('listening');
-  };
-
-  return function() {
-    if (active) { rec.stop(); return; }
-    active = true;
+  function browserFallback() {
+    if (!SR) {
+      alert('Voice input unavailable: no MediaRecorder and no browser speech recognition.');
+      return;
+    }
+    const rec = new SR();
+    rec.lang = 'en-US';
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    rec.onresult = function(e) {
+      const text = e.results[0][0].transcript;
+      document.getElementById('q').value = text;
+      window._chat();
+    };
+    rec.onend = function() {
+      document.getElementById('mic-btn').classList.remove('listening');
+    };
+    rec.onerror = rec.onend;
     document.getElementById('mic-btn').classList.add('listening');
     rec.start();
+  }
+
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    return browserFallback;
+  }
+
+  let recorder = null, chunks = [], stream = null, stopTimer = null;
+
+  async function finishRecording() {
+    const btn = document.getElementById('mic-btn');
+    btn.classList.remove('listening');
+    btn.disabled = true;
+    try {
+      const blob = new Blob(chunks, {type: (recorder && recorder.mimeType) || 'audio/webm'});
+      const resp = await fetch('/speech/transcribe', {
+        method: 'POST',
+        headers: {'Content-Type': blob.type || 'audio/webm'},
+        body: blob
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || 'transcription failed');
+      const text = (data.text || '').trim();
+      if (text) {
+        document.getElementById('q').value = text;
+        window._chat();
+      }
+    } catch (e) {
+      console.warn('AWS speech transcription failed; falling back to browser STT', e);
+      browserFallback();
+    } finally {
+      if (stream) stream.getTracks().forEach(function(t) { t.stop(); });
+      recorder = null; stream = null; chunks = [];
+      btn.disabled = false;
+    }
+  }
+
+  return async function() {
+    if (recorder && recorder.state === 'recording') {
+      recorder.stop();
+      return;
+    }
+    try {
+      chunks = [];
+      stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      const options = MediaRecorder.isTypeSupported('audio/webm')
+        ? {mimeType: 'audio/webm'} : {};
+      recorder = new MediaRecorder(stream, options);
+      recorder.ondataavailable = function(e) {
+        if (e.data && e.data.size) chunks.push(e.data);
+      };
+      recorder.onstop = finishRecording;
+      document.getElementById('mic-btn').classList.add('listening');
+      recorder.start();
+      clearTimeout(stopTimer);
+      stopTimer = setTimeout(function() {
+        if (recorder && recorder.state === 'recording') recorder.stop();
+      }, 9000);
+    } catch (e) {
+      browserFallback();
+    }
   };
 })();
 

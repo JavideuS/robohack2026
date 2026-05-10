@@ -62,22 +62,9 @@ ASK_BLOCKED_TOOLS = {
     "agent_send",            # could route arbitrary commands to other modules
 }
 
-AGENT_SYSTEM_PROMPT = [{
-    "text": (
-        "You are a Unitree Go2 quadruped robot at EPFL RoboHack 2026, running "
-        "DimOS in simulation or on real hardware. You have full tool access:\n"
-        "  - navigate_with_text — go to a place by name (semantic memory)\n"
-        "  - begin_exploration / end_exploration — autonomous mapping\n"
-        "  - look_out_for — Moondream2 scans for an object class\n"
-        "  - tag_location, follow_person, execute_sport_command, relative_move, …\n\n"
-        "Use these freely to fulfill the user's intent. Be concise; confirm actions "
-        "briefly. The `speak` tool is text-only right now (TTS is intentionally "
-        "disabled), so don't expect audible output.\n\n"
-        "For 'describe scene' or 'count X' questions, reason from the semantic "
-        "map rather than hammering `observe` — observe returns an asynchronous "
-        "handle, not the image content."
-    )
-}]
+# Agent mode intentionally has no system instructions. It receives the full
+# DimOS MCP tool list and lets the MCP server/tool descriptions define behavior.
+AGENT_SYSTEM_PROMPT: list[dict] = []
 
 ASK_SYSTEM_PROMPT = [{
     "text": (
@@ -255,13 +242,16 @@ def _bedrock_stream_with_mcp(
 
     max_iterations = 8  # safety guard against runaway tool loops
     for _ in range(max_iterations):
-        resp = bedrock.converse_stream(
-            modelId=BEDROCK_MODEL_ID,
-            system=sys_prompt,
-            messages=messages,
-            toolConfig={"tools": bedrock_tools} if bedrock_tools else None,
-            inferenceConfig={"maxTokens": MAX_TOKENS},
-        )
+        request = {
+            "modelId": BEDROCK_MODEL_ID,
+            "messages": messages,
+            "inferenceConfig": {"maxTokens": MAX_TOKENS},
+        }
+        if sys_prompt:
+            request["system"] = sys_prompt
+        if bedrock_tools:
+            request["toolConfig"] = {"tools": bedrock_tools}
+        resp = bedrock.converse_stream(**request)
 
         assistant_content: list[dict] = []
         current_tool: dict[str, Any] = {}
@@ -542,7 +532,7 @@ def _filter_tools_for_mode(
                 if not any(k in t.get("description", "").lower()[:120]
                            for k in action_kw)]
         return kept, ASK_SYSTEM_PROMPT
-    # default = full agent mode
+    # Agent mode = unfiltered DimOS MCP tools and no system prompt/rules.
     return mcp_tools, AGENT_SYSTEM_PROMPT
 
 
@@ -589,13 +579,15 @@ def run_mcp_agent_stream(
             )
             return
 
-        # Filter for the requested mode (Ask drops action tools, Agent keeps all).
+        # Ask drops action tools; Agent keeps the complete DimOS MCP tool list.
         mcp_tools, system_prompt = _filter_tools_for_mode(mcp_tools, mode)
         bedrock_tools = _mcp_to_bedrock_tools(mcp_tools)
         # Cloud-side read tools are always exposed — they're pure reads of the
         # cloud server's own state (world_store, lidar map, pointcloud, pose).
-        # Available to both Ask and Agent modes.
-        bedrock_tools = bedrock_tools + CLOUD_READ_TOOLS_SPEC
+        # In Agent mode we keep the toolset as pure DimOS MCP to avoid confusing
+        # tool selection; Ask mode gets cloud reads because it is read-only.
+        if mode == "ask":
+            bedrock_tools = bedrock_tools + CLOUD_READ_TOOLS_SPEC
 
         # 2. Run the Bedrock conversation
         try:

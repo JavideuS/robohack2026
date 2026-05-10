@@ -20,7 +20,7 @@ FastAPI server that bridges a Unitree Go2 robot (running DimOS) to a live web da
 | `main.py` | FastAPI server — all endpoints + dashboard HTML |
 | `nav_bridge.py` | Direct LCM bridge: `/odom` to `/ingest/pose`, queued goals to `/goal_request` |
 | `pc_bridge.py` | Direct LCM bridge: `/lidar` pointcloud to `/ingest/pointcloud` |
-| `camera_bridge.py` | Camera frame pusher — auto-detects source (DimOS pSHM / RTSP / USB) |
+| `camera_bridge.py` | Camera frame pusher — auto-detects source (Jetson HTTP / DimOS / RTSP / USB) |
 | `dimos_bridge.py` | Reads DimOS MCP perception tools, pushes detected objects to cloud |
 | `cloud_client.py` | `CloudClient` class — reusable push client for robot-side integration |
 | `agent.py` | AWS Bedrock agent loop — natural language queries over the semantic map |
@@ -57,6 +57,16 @@ uvicorn main:app --host 0.0.0.0 --port 8080
 ## Camera stream
 
 `camera_bridge.py` pushes frames to `/frames` so the dashboard shows live video.
+For the real Go2 setup with the added Jetson/USB camera, use the HTTP JPEG
+source. Auto mode tries this first:
+
+```bash
+python camera_bridge.py --source http --http-url http://192.168.123.18:8888/frame
+```
+
+By default, non-DimOS camera sources are also republished to DimOS LCM
+(`/color_image#sensor_msgs.Image`) so DimOS visualizers can show the same camera.
+Disable that with `--no-publish-lcm`.
 
 **DimOS transport is platform-dependent:**
 - **Linux** → `LCMTransport` (UDP multicast) — confirmed working
@@ -65,8 +75,11 @@ uvicorn main:app --host 0.0.0.0 --port 8080
 Must run inside the dimos venv (`source dimos/.venv/bin/activate`) for `--source dimos`.
 
 ```bash
-# Auto-detect (LCM/pSHM → RTSP → USB webcam):
+# Auto-detect (Jetson HTTP → LCM/pSHM → RTSP → USB webcam):
 python camera_bridge.py
+
+# Jetson/new USB camera HTTP stream:
+python camera_bridge.py --source http --http-url http://192.168.123.18:8888/frame
 
 # DimOS simulation (Linux: LCM multicast, Mac: pSHM):
 python camera_bridge.py --source dimos
@@ -82,6 +95,46 @@ python camera_bridge.py --cloud-url http://<ec2-ip>:8080
 ```
 
 Stream visible at `/frames/go2_a/stream` (MJPEG) and `/frames/go2_a` (latest JPEG).
+
+For YOLO11 segmentation overlays and semantic-map ingestion, run DimOS'
+workstation YOLO bridge against this UI:
+
+```bash
+cd ~/robohack-epfl/dimos
+source .venv/bin/activate
+python scripts/workstation_yolo.py \
+  --stream-url http://192.168.123.18:8888/frame \
+  --model yolo11s-seg.pt \
+  --feed-dimos \
+  --cloud-url http://localhost:8080 \
+  --headless
+```
+
+Detections with confidence >= `0.70` are added to `/map` and appear as semantic
+objects in the 3D map and object table. The script also pushes the YOLO mask
+overlay frame to `/frames`, so the UI camera panel shows the segmented view.
+
+## Voice input / speech-to-text
+
+The microphone button records a short browser audio clip, uploads it to
+`POST /speech/transcribe`, and uses Amazon Transcribe to convert it to text
+before sending it to the active Ask/Agent tab. If AWS Transcribe is unavailable,
+the UI falls back to the browser's built-in speech recognition where supported.
+
+Amazon Transcribe uses the same AWS credentials already used for Bedrock/S3.
+For short clips the server uploads the audio to S3, starts a transcription job,
+polls it, returns the transcript, then deletes the temporary audio object.
+
+```bash
+export S3_BUCKET=your-bucket-name
+export AWS_REGION=us-west-2
+export AWS_TRANSCRIBE_LANGUAGE=en-US
+export AWS_TRANSCRIBE_TIMEOUT=45
+```
+
+This lets voice commands such as "follow me", "find the chair", or "go to the
+door" enter Agent mode exactly like typed commands, so the DimOS MCP tools stay
+the execution path.
 
 ## Run the bridges (laptop, with DimOS running)
 
@@ -104,8 +157,19 @@ python pc_bridge.py --cloud-url http://localhost:8080
 | `AWS_REGION` | `eu-west-1` | AWS region (use `eu-north-1` for Stockholm) |
 | `PC_ACCUM_VOXEL_CM` | `8` | Voxel size for accumulated lidar map |
 | `PC_ACCUM_MAX_POINTS` | `120000` | Maximum accumulated lidar voxels served to the UI |
-| `AWS_ACCESS_KEY_ID` | — | IAM credentials for Bedrock + S3 |
-| `AWS_SECRET_ACCESS_KEY` | — | IAM credentials for Bedrock + S3 |
+| `PC_OBS_RADIUS_CM` | `20` | Nearby XY radius treated as actively observed around each fresh lidar hit |
+| `PC_RENDER_SCORE` | `1.2` | Minimum voxel confidence before a point is rendered in the UI |
+| `PC_MISS_DECAY` | `0.72` | Confidence multiplier when an observed-area voxel is missed in a fresh scan |
+| `PC_TIME_DECAY_PER_SEC` | `0.015` | Slow global confidence decay so old false positives eventually disappear |
+| `PC_DELETE_SCORE` | `0.35` | Delete voxels below this confidence |
+| `CAMERA_BRIDGE_SOURCE` | `auto` | Camera source for auto-spawn: `auto`, `http`, `dimos`, `rtsp`, or `opencv` |
+| `CAMERA_HTTP_URL` | `http://192.168.123.18:8888/frame` | Jetson/new USB camera JPEG frame URL |
+| `CAMERA_PUBLISH_LCM` | `true` | Republish non-DimOS camera frames to DimOS `/color_image` LCM |
+| `AWS_TRANSCRIBE_LANGUAGE` | `en-US` | Language code for AWS Transcribe voice input |
+| `AWS_TRANSCRIBE_TIMEOUT` | `45` | Seconds to wait for a short Transcribe batch job |
+| `SPEECH_S3_PREFIX` | `speech` | S3 prefix for temporary uploaded voice clips |
+| `AWS_ACCESS_KEY_ID` | — | IAM credentials for Bedrock + S3 + Transcribe |
+| `AWS_SECRET_ACCESS_KEY` | — | IAM credentials for Bedrock + S3 + Transcribe |
 
 ## API endpoints
 
@@ -124,6 +188,7 @@ python pc_bridge.py --cloud-url http://localhost:8080
 | `POST` | `/frames` | Robot pushes JPEG camera frame |
 | `GET` | `/frames/{robot_id}` | Latest camera frame |
 | `GET` | `/frames/{robot_id}/stream` | MJPEG stream |
+| `POST` | `/speech/transcribe` | AWS Transcribe short audio clip to text |
 
 ## Bedrock model
 
