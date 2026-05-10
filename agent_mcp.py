@@ -36,21 +36,72 @@ BEDROCK_MODEL_ID = os.environ.get(
 MAX_TOKENS = int(os.environ.get("BEDROCK_MAX_TOKENS", "1024"))
 MCP_TIMEOUT = float(os.environ.get("DIMOS_MCP_TIMEOUT", "60"))
 
-SYSTEM_PROMPT = [{
+# Tools that physically move the robot or modify persistent state.
+# Used in Ask mode to filter out anything that would let the LLM "do" things —
+# Ask is read-only by design.
+ASK_BLOCKED_TOOLS = {
+    "navigate_with_text",
+    "navigate_to_coordinates",
+    "navigate_to_object",
+    "begin_exploration",
+    "end_exploration",
+    "start_patrol",
+    "stop_patrol",
+    "start_security_patrol",
+    "stop_security_patrol",
+    "follow_person",
+    "stop_following",
+    "look_out_for",          # starts the perception loop, not strictly read-only
+    "stop_looking_out",
+    "relative_move",
+    "execute_sport_command",
+    "tag_location",          # writes to spatial memory
+    "stop_navigation",
+    "stop_robot",
+    "patrol",
+    "agent_send",            # could route arbitrary commands to other modules
+}
+
+AGENT_SYSTEM_PROMPT = [{
     "text": (
-        "You are the brain of a Unitree Go2 quadruped robot running DimOS, "
-        "operating either in simulation or in the real world. You can:\n"
-        "  - Navigate via the semantic map (navigate_with_text)\n"
-        "  - Explore autonomously (begin_exploration / end_exploration)\n"
-        "  - Look out for objects (look_out_for)\n"
-        "  - Tag locations (tag_location), patrol, follow people, etc.\n"
-        "Be concise. Confirm actions out loud (the speak skill is silent text "
-        "for now, that's expected). For 'count X' or 'describe scene' style "
-        "questions, prefer answering from the semantic map and your own "
-        "reasoning rather than hammering the observe tool — observe returns "
-        "an asynchronous handle, not the image content."
+        "You are a Unitree Go2 quadruped robot at EPFL RoboHack 2026, running "
+        "DimOS in simulation or on real hardware. You have full tool access:\n"
+        "  - navigate_with_text — go to a place by name (semantic memory)\n"
+        "  - begin_exploration / end_exploration — autonomous mapping\n"
+        "  - look_out_for — Moondream2 scans for an object class\n"
+        "  - tag_location, follow_person, execute_sport_command, relative_move, …\n\n"
+        "Use these freely to fulfill the user's intent. Be concise; confirm actions "
+        "briefly. The `speak` tool is text-only right now (TTS is intentionally "
+        "disabled), so don't expect audible output.\n\n"
+        "For 'describe scene' or 'count X' questions, reason from the semantic "
+        "map rather than hammering `observe` — observe returns an asynchronous "
+        "handle, not the image content."
     )
 }]
+
+ASK_SYSTEM_PROMPT = [{
+    "text": (
+        "You are the perceptual / awareness layer of a Unitree Go2 robot at "
+        "EPFL RoboHack 2026. You have FULL READ access to the dimos MCP server: "
+        "the camera, semantic map, spatial memory, robot pose, navigation state, "
+        "module list, server status, and so on. Use whatever read tools you need "
+        "to answer the user's question accurately.\n\n"
+        "However, you CANNOT make the robot move or trigger any action — those "
+        "tools are intentionally disabled in this mode. If the user asks for an "
+        "action (go, navigate, explore, follow, stop), briefly explain what you "
+        "would do and tell them to switch to the **Agent** tab (🤖) to execute. "
+        "Don't refuse rudely — just hand off cleanly.\n\n"
+        "When data is missing, say so plainly and suggest a next step (e.g. "
+        "'no objects mapped yet — switch to Agent and ask it to explore'). "
+        "When partially confident, give your best estimate with stated "
+        "confidence ('the chair seems to be near (1.2, 0.3)m, ~70% sure'). "
+        "Don't fabricate; don't over-refuse.\n\n"
+        "Be concise — replies render in a small chat bubble."
+    )
+}]
+
+# Default / legacy alias preserved for any caller that imported SYSTEM_PROMPT.
+SYSTEM_PROMPT = AGENT_SYSTEM_PROMPT
 
 
 def _load_dotenv_from_dimos() -> None:
@@ -192,6 +243,7 @@ def _bedrock_stream_with_mcp(
     user_message: str,
     mcp: MCPClient,
     bedrock_tools: list[dict],
+    system_prompt: list[dict] | None = None,
 ) -> Generator[str, None, None]:
     """Multi-turn loop: ask the model → stream tokens → if it requested a
     tool_use, call MCP, append result, loop until the model stops."""
@@ -199,12 +251,13 @@ def _bedrock_stream_with_mcp(
 
     bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
     messages: list[dict] = [{"role": "user", "content": [{"text": user_message}]}]
+    sys_prompt = system_prompt if system_prompt is not None else AGENT_SYSTEM_PROMPT
 
     max_iterations = 8  # safety guard against runaway tool loops
     for _ in range(max_iterations):
         resp = bedrock.converse_stream(
             modelId=BEDROCK_MODEL_ID,
-            system=SYSTEM_PROMPT,
+            system=sys_prompt,
             messages=messages,
             toolConfig={"tools": bedrock_tools} if bedrock_tools else None,
             inferenceConfig={"maxTokens": MAX_TOKENS},
@@ -278,10 +331,16 @@ def _bedrock_stream_with_mcp(
                 tu = blk["toolUse"]
                 yield f"\n[→ {tu['name']}({json.dumps(tu.get('input', {}))})]\n"
                 try:
-                    output = mcp.call_tool(tu["name"], tu.get("input", {}))
+                    if tu["name"] in CLOUD_TOOL_HANDLERS:
+                        # Cloud-side read tool — no MCP roundtrip
+                        output = CLOUD_TOOL_HANDLERS[tu["name"]](
+                            tu.get("input", {})
+                        )
+                    else:
+                        output = mcp.call_tool(tu["name"], tu.get("input", {}))
                 except Exception as e:
                     output = f"Error calling {tu['name']}: {e}"
-                    logger.exception("MCP tool call failed")
+                    logger.exception("Tool call failed")
                 # Truncate giant outputs so we don't blow the context
                 if len(output) > 4000:
                     output = output[:4000] + "\n[...truncated]"
@@ -298,9 +357,206 @@ def _bedrock_stream_with_mcp(
 
 # ── Public Interface ─────────────────────────────────────────
 
-def run_mcp_agent_stream(user_message: str) -> Generator[str, None, None]:
+# ── Cloud-side read tools (FastAPI loopback) ─────────────────
+#
+# These augment the dimos MCP toolset with tools that read the *cloud server's*
+# own state — the cumulative semantic map (world_store), live lidar voxel map,
+# pointcloud stats, robot pose, etc. This way Ask mode has full visibility into
+# what the cloud knows about the world WITHOUT being able to drive the robot.
+
+CLOUD_BASE = os.environ.get("CLOUD_SELF_URL", "http://localhost:8080")
+
+
+def _cloud_get(path: str, timeout: float = 3.0) -> dict | list | None:
+    try:
+        r = httpx.get(f"{CLOUD_BASE}{path}", timeout=timeout)
+        if r.status_code != 200:
+            return {"_error": f"{path} returned {r.status_code}"}
+        return r.json()
+    except Exception as e:
+        return {"_error": f"{path}: {e}"}
+
+
+def _cloud_tool_get_semantic_map(args: dict) -> str:
+    """All cumulative objects detected by the robot, with positions + confidence."""
+    data = _cloud_get("/map") or {}
+    if isinstance(data, dict) and data.get("_error"):
+        return f"(could not reach cloud /map: {data['_error']})"
+    objs = data.get("objects", []) if isinstance(data, dict) else []
+    if not objs:
+        return ("Semantic map is empty — no objects detected yet. "
+                "If you want detections, switch to Agent and ask it to explore.")
+    lines = [f"Semantic map ({len(objs)} object(s)):"]
+    for o in sorted(objs, key=lambda x: -(x.get('confidence') or 0))[:30]:
+        lines.append(
+            f"  - {o.get('label')}: "
+            f"({(o.get('pose') or {}).get('x', 0):.2f}, "
+            f"{(o.get('pose') or {}).get('y', 0):.2f}) m  "
+            f"conf {(o.get('confidence') or 0)*100:.0f}%  "
+            f"seen {o.get('seen_count', 1)}×"
+        )
+    return "\n".join(lines)
+
+
+def _cloud_tool_get_robot_pose(args: dict) -> str:
+    """Live robot position + orientation from the most recent nav_bridge update."""
+    data = _cloud_get("/pose/live") or {}
+    if isinstance(data, dict) and data.get("_error"):
+        return f"(could not reach /pose/live: {data['_error']})"
+    pose = data.get("go2_a") if isinstance(data, dict) else None
+    if not pose and isinstance(data, dict) and data:
+        pose = next((v for v in data.values() if isinstance(v, dict)), None)
+    if not pose:
+        return ("Robot pose unknown — nav_bridge may not be running or the robot "
+                "hasn't published odometry yet.")
+    x = pose.get("x") if isinstance(pose, dict) else None
+    y = pose.get("y") if isinstance(pose, dict) else None
+    th = pose.get("yaw") if isinstance(pose, dict) else None
+    return f"Robot at (x={x:.2f}, y={y:.2f}) m, heading ≈ {th:.2f} rad" if x is not None else str(pose)
+
+
+def _cloud_tool_get_costmap_summary(args: dict) -> str:
+    """Brief stats on the accumulated live lidar voxel map."""
+    data = _cloud_get("/pointcloud/live") or {}
+    if isinstance(data, dict) and data.get("_error"):
+        return f"(could not reach /pointcloud/live: {data['_error']})"
+    if not data:
+        return "No accumulated lidar map yet (pc_bridge may not be running)."
+    parts = []
+    for robot, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        age = time.time() - (info.get("timestamp") or 0)
+        parts.append(
+            f"{robot}: {info.get('n', 0)} accumulated lidar voxels, "
+            f"voxel size {info.get('voxel_cm', '?')} cm, age {age:.1f}s"
+        )
+    return "\n".join(parts) if parts else "Accumulated lidar map is empty."
+
+
+def _cloud_tool_get_pointcloud_stats(args: dict) -> str:
+    """How many lidar points the cloud currently has + their z-range."""
+    data = _cloud_get("/pointcloud/live") or {}
+    if isinstance(data, dict) and data.get("_error"):
+        return f"(could not reach /pointcloud/live: {data['_error']})"
+    if not data:
+        return "No pointcloud yet — pc_bridge may not be running."
+    parts = []
+    for robot, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        n = info.get("n", 0)
+        zmin = (info.get("z_min") or 0) / 100.0
+        zmax = (info.get("z_max") or 0) / 100.0
+        age = time.time() - (info.get("timestamp") or 0)
+        voxel = info.get("voxel_cm")
+        voxel_txt = f", voxel {voxel} cm" if voxel else ""
+        parts.append(
+            f"{robot}: {n} accumulated lidar points{voxel_txt}, "
+            f"z in [{zmin:.2f}, {zmax:.2f}] m, age {age:.1f}s"
+        )
+    return "\n".join(parts) if parts else "Pointcloud state empty."
+
+
+# Tool spec definitions (Bedrock format) for the cloud-read tools.
+# These are appended to the dimos MCP tool list before being handed to the model.
+CLOUD_READ_TOOLS_SPEC = [
+    {
+        "toolSpec": {
+            "name": "get_semantic_map",
+            "description": (
+                "Cloud-side: list every object the robot has detected, with 3D "
+                "position, confidence, and how many times it was seen. Read-only."
+            ),
+            "inputSchema": {"json": {"type": "object", "properties": {}}},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "get_robot_pose",
+            "description": (
+                "Cloud-side: current robot position (x, y) in metres and heading "
+                "(rad), from the most recent odometry update. Read-only."
+            ),
+            "inputSchema": {"json": {"type": "object", "properties": {}}},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "get_costmap_summary",
+            "description": (
+                "Cloud-side: summary of the accumulated live lidar voxel map. "
+                "Use this to verify the pointcloud bridge is alive. Read-only."
+            ),
+            "inputSchema": {"json": {"type": "object", "properties": {}}},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "get_pointcloud_stats",
+            "description": (
+                "Cloud-side: number of accumulated lidar points and z-range "
+                "(height) currently in the voxel map, plus age. Read-only."
+            ),
+            "inputSchema": {"json": {"type": "object", "properties": {}}},
+        }
+    },
+]
+
+CLOUD_TOOL_HANDLERS = {
+    "get_semantic_map":      _cloud_tool_get_semantic_map,
+    "get_robot_pose":        _cloud_tool_get_robot_pose,
+    "get_costmap_summary":   _cloud_tool_get_costmap_summary,
+    "get_pointcloud_stats":  _cloud_tool_get_pointcloud_stats,
+}
+
+
+def _import_time():
+    """Allow `time` module access without polluting the top-level imports."""
+    import time as _t
+    return _t
+
+
+# Patch in `time` for _cloud_tool_get_pointcloud_stats (avoid global pollution above)
+import time  # noqa: E402
+
+
+def _filter_tools_for_mode(
+    mcp_tools: list[dict], mode: str
+) -> tuple[list[dict], list[dict]]:
+    """Pick the tool subset and system prompt for a given mode.
+
+    Returns (mcp_tools_subset, system_prompt). The Ask filter is permissive:
+    we keep every tool the dimos MCP exposes UNLESS its name matches the
+    explicit blocklist (anything that moves the robot or writes state).
+    That way new read-only tools added to dimos in the future still show up
+    in Ask without having to be added to a whitelist.
+    """
+    if mode == "ask":
+        kept = [t for t in mcp_tools if t["name"] not in ASK_BLOCKED_TOOLS]
+        # If anything got through that's clearly an action (description
+        # contains the word "move"/"navigate"/"explore" etc.), drop it too.
+        action_kw = ("navigate", "move ", "explor", "patrol", "follow",
+                     "drive", "walk", "stop ", "halt", "rotate ")
+        kept = [t for t in kept
+                if not any(k in t.get("description", "").lower()[:120]
+                           for k in action_kw)]
+        return kept, ASK_SYSTEM_PROMPT
+    # default = full agent mode
+    return mcp_tools, AGENT_SYSTEM_PROMPT
+
+
+def run_mcp_agent_stream(
+    user_message: str,
+    mode: str = "agent",
+) -> Generator[str, None, None]:
     """Public entrypoint — same shape as agent.run_agent_stream so it drops
     into the existing /query/stream endpoint. Yields text tokens.
+
+    Args:
+        user_message: the user's chat text.
+        mode: 'agent' (default) → full tool access, can move the robot.
+              'ask' → read-only tool subset, never sends commands.
 
     Failure modes (each yields a human-readable error then returns):
       - MCP server unreachable  → "MCP not reachable, is dimos running?"
@@ -333,11 +589,19 @@ def run_mcp_agent_stream(user_message: str) -> Generator[str, None, None]:
             )
             return
 
+        # Filter for the requested mode (Ask drops action tools, Agent keeps all).
+        mcp_tools, system_prompt = _filter_tools_for_mode(mcp_tools, mode)
         bedrock_tools = _mcp_to_bedrock_tools(mcp_tools)
+        # Cloud-side read tools are always exposed — they're pure reads of the
+        # cloud server's own state (world_store, lidar map, pointcloud, pose).
+        # Available to both Ask and Agent modes.
+        bedrock_tools = bedrock_tools + CLOUD_READ_TOOLS_SPEC
 
         # 2. Run the Bedrock conversation
         try:
-            yield from _bedrock_stream_with_mcp(user_message, mcp, bedrock_tools)
+            yield from _bedrock_stream_with_mcp(
+                user_message, mcp, bedrock_tools, system_prompt=system_prompt
+            )
         except ImportError:
             yield "⚠ boto3 not installed in this venv. `pip install boto3`.\n"
         except Exception as e:

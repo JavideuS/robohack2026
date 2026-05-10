@@ -6,7 +6,8 @@ FastAPI server that bridges a Unitree Go2 robot (running DimOS) to a live web da
 
 ```
 [Laptop / DimOS]                [EC2 :8080]              [Phone / Browser]
-  ws_bridge.py  ── POST ──────→  /ingest/map  ←── GET ──  /map/live
+  nav_bridge.py ── POST ──────→  /ingest/pose ←── GET ──  /pose/live
+  pc_bridge.py  ── POST ──────→  /ingest/pointcloud ←── GET ── /pointcloud/live
   dimos_bridge  ── POST ──────→  /ingest       ←── GET ──  /
   cloud_client  ── POST ──────→  /frames       ← POST ──→  /query/stream
                                                    POST ──→ /navigate
@@ -17,7 +18,8 @@ FastAPI server that bridges a Unitree Go2 robot (running DimOS) to a live web da
 | File | Purpose |
 |---|---|
 | `main.py` | FastAPI server — all endpoints + dashboard HTML |
-| `ws_bridge.py` | Connects to DimOS Socket.IO (port 7779), relays costmap/path/pose to cloud |
+| `nav_bridge.py` | Direct LCM bridge: `/odom` to `/ingest/pose`, queued goals to `/goal_request` |
+| `pc_bridge.py` | Direct LCM bridge: `/lidar` pointcloud to `/ingest/pointcloud` |
 | `camera_bridge.py` | Camera frame pusher — auto-detects source (DimOS pSHM / RTSP / USB) |
 | `dimos_bridge.py` | Reads DimOS MCP perception tools, pushes detected objects to cloud |
 | `cloud_client.py` | `CloudClient` class — reusable push client for robot-side integration |
@@ -81,20 +83,16 @@ python camera_bridge.py --cloud-url http://<ec2-ip>:8080
 
 Stream visible at `/frames/go2_a/stream` (MJPEG) and `/frames/go2_a` (latest JPEG).
 
-## Run the bridge (laptop, with DimOS running)
+## Run the bridges (laptop, with DimOS running)
 
 ```bash
-# Point ws_bridge at EC2
-python ws_bridge.py --cloud-url http://<ec2-public-ip>:8080
+# Point nav/pointcloud bridges at EC2
+python nav_bridge.py --cloud-url http://<ec2-public-ip>:8080
+python pc_bridge.py --cloud-url http://<ec2-public-ip>:8080
 
 # Or locally
-python ws_bridge.py --cloud-url http://localhost:8080
-
-# Send a one-shot navigation goal
-python ws_bridge.py --send-goal 2.0 1.5
-
-# Start autonomous exploration
-python ws_bridge.py --explore
+python nav_bridge.py --cloud-url http://localhost:8080
+python pc_bridge.py --cloud-url http://localhost:8080
 ```
 
 ## Environment variables
@@ -104,7 +102,8 @@ python ws_bridge.py --explore
 | `USE_MEMORY_STORE` | `true` | `false` to persist map to S3 |
 | `S3_BUCKET` | `robohack-map` | S3 bucket name |
 | `AWS_REGION` | `eu-west-1` | AWS region (use `eu-north-1` for Stockholm) |
-| `DIMOS_WS_URL` | `ws://localhost:7779` | DimOS Socket.IO URL |
+| `PC_ACCUM_VOXEL_CM` | `8` | Voxel size for accumulated lidar map |
+| `PC_ACCUM_MAX_POINTS` | `120000` | Maximum accumulated lidar voxels served to the UI |
 | `AWS_ACCESS_KEY_ID` | — | IAM credentials for Bedrock + S3 |
 | `AWS_SECRET_ACCESS_KEY` | — | IAM credentials for Bedrock + S3 |
 
@@ -115,9 +114,11 @@ python ws_bridge.py --explore
 | `GET` | `/` | Live dashboard (map + chat + objects) |
 | `GET` | `/health` | Health check |
 | `POST` | `/ingest` | Robot pushes detected objects |
-| `POST` | `/ingest/map` | Bridge pushes costmap / path / pose |
+| `POST` | `/ingest/pose` | Nav bridge pushes live odometry pose |
+| `POST` | `/ingest/pointcloud` | Pointcloud bridge pushes compressed lidar points |
 | `GET` | `/map` | Merged semantic map (all robots) |
-| `GET` | `/map/live` | Raw live map state (costmap + path + pose) |
+| `GET` | `/pose/live` | Latest robot pose by robot id |
+| `GET` | `/pointcloud/live` | Accumulated lidar voxel pointcloud by robot id |
 | `POST` | `/query/stream` | SSE — natural language query via Bedrock |
 | `POST` | `/navigate` | Send navigation goal to robot |
 | `POST` | `/frames` | Robot pushes JPEG camera frame |

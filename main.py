@@ -39,6 +39,64 @@ USE_MEMORY_STORE = os.environ.get("USE_MEMORY_STORE", "true").lower() == "true"
 
 # ── App Lifespan ──────────────────────────────────────────────
 
+# Spawn direct-LCM bridges when dimos is reachable locally. Set
+# AUTO_BRIDGES=false to disable, e.g. when running the cloud UI on EC2.
+AUTO_BRIDGES = os.environ.get("AUTO_BRIDGES", "true").lower() == "true"
+CAMERA_BRIDGE_FPS = os.environ.get("CAMERA_BRIDGE_FPS", "10")
+SELF_URL = os.environ.get("SELF_URL", "http://localhost:8080")
+PC_ACCUM_VOXEL_CM = max(1, int(os.environ.get("PC_ACCUM_VOXEL_CM", "8")))
+PC_ACCUM_MAX_POINTS = max(1000, int(os.environ.get("PC_ACCUM_MAX_POINTS", "120000")))
+
+
+def _spawn_bridges() -> list:
+    """Launch local bridges as subprocesses.
+
+    Each bridge will reconnect on its own if dimos starts late. Failures here
+    are logged but never fatal; the dashboard still serves without bridges.
+    """
+    import subprocess
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    procs: list = []
+    py = sys.executable
+
+    # All bridges talk to dimos via LCM directly — no Socket.IO / command-center.
+    bridge_specs = [
+        (
+            "camera_bridge",
+            [py, "-u", os.path.join(here, "camera_bridge.py"),
+             "--cloud-url", SELF_URL,
+             "--fps", str(CAMERA_BRIDGE_FPS)],
+        ),
+        (
+            "pc_bridge",
+            [py, "-u", os.path.join(here, "pc_bridge.py"),
+             "--cloud-url", SELF_URL,
+             "--fps", os.environ.get("PC_BRIDGE_FPS", "5")],
+        ),
+        (
+            "nav_bridge",
+            [py, "-u", os.path.join(here, "nav_bridge.py"),
+             "--cloud-url", SELF_URL,
+             "--pose-hz", os.environ.get("NAV_POSE_HZ", "15"),
+             "--goal-hz", os.environ.get("NAV_GOAL_POLL_HZ", "5")],
+        ),
+    ]
+    for name, cmd in bridge_specs:
+        try:
+            p = subprocess.Popen(
+                cmd,
+                cwd=here,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            procs.append((name, p))
+            logger.info(f"[lifespan] spawned {name} pid={p.pid}")
+        except Exception as e:
+            logger.warning(f"[lifespan] failed to spawn {name}: {e}")
+    return procs
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize shared resources on startup."""
@@ -51,7 +109,21 @@ async def lifespan(app: FastAPI):
         f"World store initialized: {'memory' if USE_MEMORY_STORE else 'S3'} "
         f"(bucket={S3_BUCKET})"
     )
-    yield
+    app.state.bridge_procs = _spawn_bridges() if AUTO_BRIDGES else []
+    try:
+        yield
+    finally:
+        # Best-effort cleanup of bridge subprocesses on shutdown.
+        for name, p in app.state.bridge_procs:
+            try:
+                p.terminate()
+                p.wait(timeout=2)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            logger.info(f"[lifespan] stopped {name}")
 
 
 app = FastAPI(
@@ -94,37 +166,41 @@ async def ingest(request: IngestRequest):
 
 # ── User Endpoints (Req 2: Query) ────────────────────────────
 
+def _stream_mcp_response(text: str, mode: str) -> StreamingResponse:
+    """Shared SSE wrapper around the MCP-aware Bedrock agent."""
+    from agent_mcp import run_mcp_agent_stream
+
+    def generate():
+        try:
+            for token in run_mcp_agent_stream(text, mode=mode):
+                yield f"data: {json.dumps(token)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.exception("MCP agent stream error")
+            yield f"data: {json.dumps(f'Error: {e}')}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/query/stream")
 async def query_stream(request: QueryRequest):
-    """Chat with the robot.
+    """🧠 Ask mode — read-only Q&A over the dimos MCP.
 
-    Default backend = MCP-aware Bedrock agent (Claude Sonnet 4.6 + dimos MCP
-    tools at localhost:9990). Falls back to the local semantic-map agent
-    only if the MCP backend errors at import-time.
+    The agent has the full set of dimos read-only tools (observe, server_status,
+    spatial-memory queries, …) but NO movement / action tools. If the user
+    asks the robot to act, the agent explains and points them to the Agent tab.
     """
     store: WorldStateStore = app.state.world_store
-
     use_mcp = os.environ.get("USE_MCP_AGENT", "true").lower() == "true"
 
     if use_mcp:
         try:
-            from agent_mcp import run_mcp_agent_stream
-
-            def generate_mcp():
-                try:
-                    for token in run_mcp_agent_stream(request.text):
-                        yield f"data: {json.dumps(token)}\n\n"
-                    yield "data: [DONE]\n\n"
-                except Exception as e:
-                    logger.exception("MCP agent stream error")
-                    yield f"data: {json.dumps(f'Error: {e}')}\n\n"
-                    yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                generate_mcp(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
+            return _stream_mcp_response(request.text, mode="ask")
         except ImportError as e:
             logger.warning(f"MCP agent unavailable, using fallback: {e}")
 
@@ -150,76 +226,19 @@ async def query_stream(request: QueryRequest):
     )
 
 
-# ── Live Map State (costmap + path + robot_pose) ─────────────
-
-_live_map: dict = {}
-_grid_buf: list[int] | None = None
-_grid_shape: list[int] = [0, 0]
-_grid_version: int = 0
-
-
-def _decode_grid(grid_data: dict) -> list[int] | None:
-    """
-    Decode DimOS OptimizedCostmapEncoder → flat uint8 list.
-    Values: 0=free, 1-89=gradient, 90-100=occupied, 255=unknown.
-    """
-    global _grid_buf, _grid_shape, _grid_version
-    shape = grid_data.get("shape", [0, 0])
-    h, w = shape
-    update_type = grid_data.get("update_type", "full")
-    try:
-        if update_type == "full":
-            raw = zlib.decompress(base64.b64decode(grid_data["data"]))
-            _grid_buf = list(raw)
-            _grid_shape = shape
-            _grid_version += 1
-            return _grid_buf
-        elif update_type == "delta":
-            if _grid_buf is None or _grid_shape != shape:
-                return None
-            grid = list(_grid_buf)
-            for chunk in grid_data.get("chunks", []):
-                cy, cx = chunk["pos"]
-                ch, cw = chunk["size"]
-                raw = zlib.decompress(base64.b64decode(chunk["data"]))
-                for y in range(ch):
-                    for x in range(cw):
-                        idx = (cy + y) * w + (cx + x)
-                        if idx < len(grid):
-                            grid[idx] = raw[y * cw + x]
-            _grid_buf = grid
-            _grid_shape = shape
-            _grid_version += 1
-            return _grid_buf
-    except Exception as e:
-        logger.debug(f"Costmap decode error: {e}")
-    return None
-
-
-@app.post("/ingest/map")
-async def ingest_map(request: Request):
-    """Bridge pushes raw map state (costmap, path, robot_pose)."""
-    data = await request.json()
-    cm = data.get("costmap")
-    if cm and isinstance(cm, dict) and "grid" in cm:
-        flat = _decode_grid(cm["grid"])
-        if flat is not None:
-            data = dict(data)
-            data["costmap"] = {
-                "b64": base64.b64encode(bytes(flat)).decode(),
-                "shape": _grid_shape,
-                "resolution": cm.get("resolution", 0.05),
-                "origin": cm.get("origin"),
-                "v": _grid_version,
-            }
-    _live_map.update({k: v for k, v in data.items() if v is not None})
-    _live_map["timestamp"] = time.time()
-    return {"status": "ok"}
-
-
-@app.get("/map/live")
-async def get_live_map():
-    return _live_map
+@app.post("/command/stream")
+async def command_stream(request: QueryRequest):
+    """🤖 Agent mode — full tool access. Can move the robot, explore, etc."""
+    use_mcp = os.environ.get("USE_MCP_AGENT", "true").lower() == "true"
+    if use_mcp:
+        try:
+            return _stream_mcp_response(request.text, mode="agent")
+        except ImportError as e:
+            logger.warning(f"MCP agent unavailable: {e}")
+    raise HTTPException(
+        status_code=503,
+        detail="Agent backend unavailable. Set USE_MCP_AGENT=true and ensure dimos MCP is running.",
+    )
 
 
 # ── Camera Frames ─────────────────────────────────────────────
@@ -258,10 +277,46 @@ async def stream_frames(robot_id: str):
 
 
 # ── LiDAR Point Cloud ─────────────────────────────────────────
-# lidar_bridge.py POSTs zlib-compressed int16 triplets (x_cm, y_cm, z_cm).
-# We decompress, re-encode as base64, and serve to the dashboard.
+# pc_bridge.py POSTs zlib-compressed int16 triplets (x_cm, y_cm, z_cm).
+# We accumulate those raw lidar points into a coarse voxel map so the UI shows
+# the explored area, not only the most recent scan.
 
-_live_pc: dict[str, dict] = {}  # robot_id → {b64, n, z_min, z_max, timestamp}
+_live_pc: dict[str, dict] = {}  # robot_id -> {b64, n, z_min, z_max, timestamp}
+_pc_voxels: dict[str, dict[tuple[int, int, int], tuple[int, int, int]]] = {}
+
+
+def _rebuild_accumulated_pointcloud(robot_id: str) -> None:
+    voxels = _pc_voxels.get(robot_id, {})
+    pts = list(voxels.values())
+    if not pts:
+        _live_pc[robot_id] = {
+            "b64": "",
+            "n": 0,
+            "z_min": 0,
+            "z_max": 0,
+            "timestamp": time.time(),
+            "voxel_cm": PC_ACCUM_VOXEL_CM,
+            "accumulated": True,
+        }
+        return
+
+    raw = bytearray(len(pts) * 6)
+    z_min = 32767
+    z_max = -32768
+    for i, (x, y, z) in enumerate(pts):
+        struct.pack_into("<hhh", raw, i * 6, x, y, z)
+        z_min = min(z_min, z)
+        z_max = max(z_max, z)
+
+    _live_pc[robot_id] = {
+        "b64": base64.b64encode(raw).decode(),
+        "n": len(pts),
+        "z_min": z_min,
+        "z_max": z_max,
+        "timestamp": time.time(),
+        "voxel_cm": PC_ACCUM_VOXEL_CM,
+        "accumulated": True,
+    }
 
 
 @app.post("/ingest/pointcloud")
@@ -274,18 +329,23 @@ async def ingest_pointcloud(request: Request):
         raw = zlib.decompress(body)
         n = struct.unpack_from("<i", raw)[0]
         pts_bytes = raw[4:]  # N × 6 bytes of int16 triplets
-        # Compute z range for the dashboard colour mapper
-        z_vals = [
-            struct.unpack_from("<h", pts_bytes, i * 6 + 4)[0]
-            for i in range(n)
-        ]
-        _live_pc[robot_id] = {
-            "b64": base64.b64encode(pts_bytes).decode(),
-            "n": n,
-            "z_min": min(z_vals) if z_vals else 0,
-            "z_max": max(z_vals) if z_vals else 0,
-            "timestamp": time.time(),
-        }
+        if len(pts_bytes) < n * 6:
+            raise ValueError(f"payload too short for {n} points")
+
+        voxels = _pc_voxels.setdefault(robot_id, {})
+        step = PC_ACCUM_VOXEL_CM
+        for i in range(n):
+            x, y, z = struct.unpack_from("<hhh", pts_bytes, i * 6)
+            key = (round(x / step), round(y / step), round(z / step))
+            voxels[key] = (x, y, z)
+
+        # Bound memory and UI payload size. Dict order is insertion order; this
+        # drops the oldest never-updated voxels first.
+        overflow = len(voxels) - PC_ACCUM_MAX_POINTS
+        for _ in range(max(0, overflow)):
+            voxels.pop(next(iter(voxels)))
+
+        _rebuild_accumulated_pointcloud(robot_id)
     except Exception as e:
         raise HTTPException(400, f"Decode error: {e}")
     return {"status": "ok", "robot_id": robot_id, "n": _live_pc[robot_id]["n"]}
@@ -296,6 +356,31 @@ async def get_live_pointcloud():
     return _live_pc
 
 
+# ── Live robot pose (replaces costmap-bound pose path) ───────
+
+# Latest pose per robot. nav_bridge.py POSTs at ~15 Hz from /odom LCM.
+_live_pose: dict[str, dict] = {}
+
+
+@app.post("/ingest/pose")
+async def ingest_pose(request: Request):
+    robot_id = request.headers.get("X-Robot-Id", "go2_a")
+    try:
+        data = await request.json()
+    except Exception as e:
+        raise HTTPException(400, f"bad JSON: {e}")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "expected pose dict")
+    data["robot_id"] = robot_id
+    _live_pose[robot_id] = data
+    return {"status": "ok"}
+
+
+@app.get("/pose/live")
+async def get_live_pose():
+    return _live_pose
+
+
 # ── Navigation — goal queue ───────────────────────────────────
 
 _goal_queue: list[dict] = []
@@ -303,7 +388,7 @@ _goal_queue: list[dict] = []
 
 @app.post("/navigate")
 async def navigate_to_point(x: float, y: float, z: float = 0.0):
-    """Queue a navigation goal — ws_bridge polls /goals/pending and forwards to DimOS."""
+    """Queue a navigation goal — nav_bridge forwards it to DimOS over LCM."""
     _goal_queue.append({"x": x, "y": y, "z": z, "ts": time.time()})
     return {"status": "queued", "target": {"x": x, "y": y, "z": z}}
 
@@ -363,11 +448,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 transition: background 0.3s; margin-left: auto; }
     #conn-dot.live { background: #81c784; box-shadow: 0 0 6px #81c784; }
 
-    .layout { display: grid; grid-template-columns: 1fr 310px;
-              height: calc(100vh - 44px); }
+    /* Layout: map + draggable horizontal handle + sidebar.
+       Sidebar width = --sidebar-w (default 32vw, min 280px, max 60vw).
+       The user drags #h-resize to change it. */
+    .layout { display: grid; height: calc(100vh - 44px);
+              grid-template-columns: 1fr 5px clamp(280px, var(--sidebar-w, 32vw), 60vw); }
     @media (max-width: 768px) {
-      .layout { grid-template-columns: 1fr; grid-template-rows: 50vh 1fr; }
+      .layout { grid-template-columns: 1fr; grid-template-rows: 45vh 5px 1fr; }
     }
+    #h-resize { background: transparent; cursor: col-resize;
+                border-left: 1px solid #1e2d3d; border-right: 1px solid #1e2d3d;
+                transition: background 0.15s; }
+    #h-resize:hover, #h-resize.active { background: rgba(79,195,247,0.3); }
 
     #map-panel { position: relative; background: #080c10; overflow: hidden; }
     #map-panel canvas { display: block; }
@@ -385,8 +477,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .section-title { font-size: 10px; font-weight: 700; color: #4fc3f7;
                      letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 6px; }
 
-    #chat { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 0;
-            display: flex; flex-direction: column; gap: 6px; }
+    /* Sidebar split into 2 vertical regions: chat (top) + camera/objects (bottom).
+       The split is governed by a CSS variable --chat-frac (0..1) and a draggable
+       horizontal handle. Default 60% chat / 40% bottom panel. */
+    #sidebar { --chat-frac: 0.60; }
+    /* Chat-tab section: takes (chat-frac × 100)% of the sidebar height */
+    #chat-section { flex: 0 0 calc(var(--chat-frac) * 100%);
+                    display: flex; flex-direction: column;
+                    min-height: 0; }
+    /* Vertical drag handle to resize chat vs bottom panel */
+    #v-resize { flex: 0 0 5px; cursor: row-resize; background: transparent;
+                border-top: 1px solid #1e2d3d; border-bottom: 1px solid #1e2d3d;
+                transition: background 0.15s; }
+    #v-resize:hover, #v-resize.active { background: rgba(79,195,247,0.3); }
+    /* Bottom panel: camera + objects share remaining space */
+    #bottom-panel { flex: 1 1 auto; display: flex; flex-direction: column;
+                    min-height: 0; overflow: hidden; }
+    .mode-toggle { display: flex; gap: 4px; padding: 6px 10px 0; flex-shrink: 0; }
+    .mode-btn { flex: 1; padding: 5px 0; font-size: 10px; font-weight: 700;
+                letter-spacing: 0.06em; text-transform: uppercase; border: none;
+                border-radius: 5px; cursor: pointer; background: transparent;
+                color: #556; transition: background 0.15s, color 0.15s; }
+    .mode-btn.active { background: #1e2d3d; color: #4fc3f7; }
+    .mode-btn:hover:not(.active) { color: #99a; }
+    .chat-pane { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 0;
+                 display: flex; flex-direction: column; gap: 6px; }
+    .chat-pane.hidden { display: none; }
     .msg { font-size: 12px; line-height: 1.5; padding: 7px 10px; border-radius: 10px;
            max-width: 88%; word-wrap: break-word; }
     .msg b { display: block; font-size: 10px; letter-spacing: 0.05em;
@@ -395,10 +511,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .msg-user { align-self: flex-end; background: #0d3b66; color: #e8f4fd;
                 border: 1px solid #1565c0; }
     .msg-user b { color: #4fc3f7; }
-    /* Robot: green-ish bubble, left-aligned */
+    /* Ask-mode robot reply: green bubble */
     .msg-robot { align-self: flex-start; background: #1a2e1f; color: #d8f3dc;
                  border: 1px solid #2d5a3d; }
     .msg-robot b { color: #81c784; }
+    /* Agent-mode reply: amber/orange to signal "this might move the robot" */
+    .msg-cmd { align-self: flex-start; background: #2e1f0a; color: #ffe0b2;
+               border: 1px solid #5a3d1a; }
+    .msg-cmd b { color: #ffb74d; }
+    .msg-cmd .tool { color: #ffd54f; }
     /* Preserve agent newlines */
     .msg span { white-space: pre-wrap; }
     /* Tool-use lines like [→ navigate_with_text({...})] rendered dim/orange */
@@ -422,9 +543,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                          animation: pulse 1s infinite; }
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
 
-    #cam-img { width: 100%; display: block; border-radius: 4px; background: #0a0e14;
-               min-height: 60px; max-height: 110px; object-fit: cover; }
-    #obj-section { overflow-y: auto; flex: 0 0 auto; max-height: 150px; }
+    /* Camera fills its parent block (now driven by the resizable bottom panel) */
+    #cam-section { flex: 1 1 50%; min-height: 80px; padding: 9px 12px;
+                   display: flex; flex-direction: column; overflow: hidden;
+                   border-bottom: 1px solid #1e2d3d; }
+    #cam-img { width: 100%; flex: 1; border-radius: 4px; background: #0a0e14;
+               min-height: 80px; object-fit: cover; }
+    #obj-section { flex: 1 1 50%; min-height: 80px; overflow-y: auto;
+                   padding: 9px 12px; }
     table { width: 100%; border-collapse: collapse; font-size: 11px; }
     td, th { padding: 4px 6px; text-align: left; border-bottom: 1px solid #1a2530; }
     th { color: #4fc3f7; font-weight: 600; background: #0d1117; position: sticky; top: 0; }
@@ -446,48 +572,82 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="nav-status"></div>
     <div id="view-hint">drag to orbit · scroll to zoom · click floor to navigate</div>
   </div>
+  <div id="h-resize" title="drag to resize sidebar"></div>
   <div id="sidebar">
-    <div class="section"><div class="section-title">Ask the robot</div></div>
-    <div id="chat"></div>
-    <div id="chat-input-row">
-      <input id="q" placeholder="Where is the chair?"
-             onkeydown="if(event.key==='Enter')window._chat()">
-      <button id="mic-btn" onclick="window._mic()" title="Voice input">🎤</button>
-      <button id="send-btn" onclick="window._chat()">Ask</button>
+    <div id="chat-section">
+      <div class="mode-toggle">
+        <button class="mode-btn active" id="mode-ask"
+                onclick="window._setMode('ask')">🧠 Ask</button>
+        <button class="mode-btn" id="mode-cmd"
+                onclick="window._setMode('cmd')">🤖 Agent</button>
+      </div>
+      <div id="chat-ask" class="chat-pane"></div>
+      <div id="chat-cmd" class="chat-pane hidden"></div>
+      <div id="chat-input-row">
+        <input id="q" placeholder="Where is the chair?"
+               onkeydown="if(event.key==='Enter')window._chat()">
+        <button id="mic-btn" onclick="window._mic()" title="Voice input">🎤</button>
+        <button id="send-btn" onclick="window._chat()">Ask</button>
+      </div>
     </div>
-    <div class="section">
-      <div class="section-title">Camera</div>
-      <img id="cam-img" src="/frames/go2_a/stream"
-           onerror="this.style.opacity='0.12'" alt="">
-    </div>
-    <div class="section" id="obj-section">
-      <div class="section-title">Objects</div>
-      <table>
-        <thead><tr><th>Label</th><th>Pos (m)</th><th>Conf</th></tr></thead>
-        <tbody id="obj-body">
-          <tr class="empty-row"><td colspan="3">Waiting for robot...</td></tr>
-        </tbody>
-      </table>
+    <!-- Vertical drag handle — chat ↕ camera/objects -->
+    <div id="v-resize" title="drag to resize chat vs camera/objects"></div>
+    <div id="bottom-panel">
+      <div id="cam-section">
+        <div class="section-title">Camera</div>
+        <img id="cam-img" src="/frames/go2_a/stream"
+             onerror="this.style.opacity='0.12'" alt="">
+      </div>
+      <div id="obj-section">
+        <div class="section-title">Objects in semantic memory</div>
+        <table>
+          <thead><tr><th>Label</th><th>Pos (m)</th><th>Conf</th></tr></thead>
+          <tbody id="obj-body">
+            <tr class="empty-row"><td colspan="3">Waiting for robot...</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
-/* Chat — must be global for onclick */
+/* Chat — two tabs (Ask 🧠 / Agent 🤖) with fully isolated histories */
+let _mode = 'ask';
+
+window._setMode = function(mode) {
+  _mode = mode;
+  document.getElementById('mode-ask').classList.toggle('active', mode === 'ask');
+  document.getElementById('mode-cmd').classList.toggle('active', mode === 'cmd');
+  document.getElementById('chat-ask').classList.toggle('hidden', mode !== 'ask');
+  document.getElementById('chat-cmd').classList.toggle('hidden', mode !== 'cmd');
+  const q = document.getElementById('q');
+  q.placeholder = mode === 'ask'
+    ? 'Where is the chair? · How many doors do you see?'
+    : 'Go to the door · explore the room · stop';
+  document.getElementById('send-btn').textContent =
+    mode === 'ask' ? 'Ask' : 'Send';
+  q.focus();
+};
+
 window._chat = async function() {
   const inp = document.getElementById('q');
   const q = inp.value.trim();
   if (!q) return;
-  _msg('You', q, 'msg-user');
+  const isCmd = _mode === 'cmd';
+  const paneId = isCmd ? 'chat-cmd' : 'chat-ask';
+  const pane = document.getElementById(paneId);
+  const endpoint = isCmd ? '/command/stream' : '/query/stream';
+
+  _msg(paneId, 'You', q, 'msg-user');
   inp.value = '';
-  const el = _msg('Go2', '', 'msg-robot');
+  const el = _msg(paneId, isCmd ? 'Agent' : 'Go2', '',
+                  isCmd ? 'msg-cmd' : 'msg-robot');
   const span = el.querySelector('span');
-  let buffer = '';   // accumulates plain text waiting to be flushed
+
+  let buffer = '';
   function flushText() {
-    if (buffer) {
-      span.appendChild(document.createTextNode(buffer));
-      buffer = '';
-    }
+    if (buffer) { span.appendChild(document.createTextNode(buffer)); buffer = ''; }
   }
   function appendChunk(s) {
     // Pull out [→ tool(...)] lines and render them as orange italic blocks.
@@ -506,7 +666,7 @@ window._chat = async function() {
     flushText();
   }
   try {
-    const resp = await fetch('/query/stream', {
+    const resp = await fetch(endpoint, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({text: q})
     });
@@ -517,14 +677,14 @@ window._chat = async function() {
       if (done) break;
       const chunk = leftover + dec.decode(value, {stream: true});
       const lines = chunk.split('\\n');
-      leftover = lines.pop() || '';   // last partial line carries over
+      leftover = lines.pop() || '';
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const tok = line.slice(6);
         if (tok === '[DONE]') return;
         try {
           appendChunk(JSON.parse(tok));
-          document.getElementById('chat').scrollTop = 99999;
+          pane.scrollTop = 99999;
         } catch(e) {}
       }
     }
@@ -532,17 +692,17 @@ window._chat = async function() {
     span.appendChild(document.createTextNode(' [error: ' + e.message + ']'));
   }
 };
-function _msg(who, text, cls) {
-  const chat = document.getElementById('chat');
+
+function _msg(paneId, who, text, cls) {
+  const pane = document.getElementById(paneId);
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
   const b = document.createElement('b');
   b.textContent = who;
   const s = document.createElement('span');
   s.textContent = text;
-  d.appendChild(b);
-  d.appendChild(s);
-  chat.appendChild(d); chat.scrollTop = 99999;
+  d.appendChild(b); d.appendChild(s);
+  pane.appendChild(d); pane.scrollTop = 99999;
   return d;
 }
 
@@ -578,6 +738,57 @@ window._mic = (function() {
     rec.start();
   };
 })();
+
+/* ── Resizable splits ────────────────────────────────────────────
+   #h-resize  (vertical bar between map and sidebar)  →  --sidebar-w
+   #v-resize  (horizontal bar inside sidebar between chat and bottom panel)
+              →  #sidebar.style.--chat-frac
+*/
+(function setupResizers() {
+  const layout = document.querySelector('.layout');
+  const sidebar = document.getElementById('sidebar');
+  const hHandle = document.getElementById('h-resize');
+  const vHandle = document.getElementById('v-resize');
+
+  let dragH = false, dragV = false;
+
+  hHandle.addEventListener('pointerdown', function(e) {
+    dragH = true; hHandle.classList.add('active');
+    document.body.style.userSelect = 'none';
+    hHandle.setPointerCapture(e.pointerId);
+  });
+  hHandle.addEventListener('pointermove', function(e) {
+    if (!dragH) return;
+    // Distance from right edge of viewport in px → set as sidebar width.
+    const w = Math.max(280, Math.min(window.innerWidth - e.clientX,
+                                     window.innerWidth * 0.60));
+    layout.style.setProperty('--sidebar-w', w + 'px');
+  });
+  hHandle.addEventListener('pointerup', function(e) {
+    dragH = false; hHandle.classList.remove('active');
+    document.body.style.userSelect = '';
+    try { hHandle.releasePointerCapture(e.pointerId); } catch(_) {}
+  });
+
+  vHandle.addEventListener('pointerdown', function(e) {
+    dragV = true; vHandle.classList.add('active');
+    document.body.style.userSelect = 'none';
+    vHandle.setPointerCapture(e.pointerId);
+  });
+  vHandle.addEventListener('pointermove', function(e) {
+    if (!dragV) return;
+    const rect = sidebar.getBoundingClientRect();
+    // Position of pointer within sidebar (0..1) — leaves 80px headroom each side.
+    const frac = Math.max(0.18,
+                          Math.min(0.85, (e.clientY - rect.top) / rect.height));
+    sidebar.style.setProperty('--chat-frac', frac.toFixed(3));
+  });
+  vHandle.addEventListener('pointerup', function(e) {
+    dragV = false; vHandle.classList.remove('active');
+    document.body.style.userSelect = '';
+    try { vHandle.releasePointerCapture(e.pointerId); } catch(_) {}
+  });
+})();
 </script>
 
 <script type="module">
@@ -611,12 +822,16 @@ controls.maxPolarAngle = Math.PI * 0.47;
 controls.minDistance = 0.3;
 controls.maxDistance = 150;
 
-let rotTimer;
-renderer.domElement.addEventListener('pointerdown', () => {
+// Auto-rotate the camera as a hint, but stop **permanently** after the
+// first user interaction (drag, scroll, click) — no resume timer.
+let _userInteracted = false;
+function _stopAutoRotate() {
+  if (_userInteracted) return;
+  _userInteracted = true;
   controls.autoRotate = false;
-  clearTimeout(rotTimer);
-  rotTimer = setTimeout(() => { controls.autoRotate = true; }, 7000);
-});
+}
+renderer.domElement.addEventListener('pointerdown', _stopAutoRotate);
+renderer.domElement.addEventListener('wheel', _stopAutoRotate, { passive: true });
 
 // ── Lights ────────────────────────────────────────────────────
 scene.add(new THREE.HemisphereLight(0x334d66, 0x0a1020, 4.5));
@@ -640,20 +855,7 @@ floor.position.y = -0.002;
 scene.add(floor);
 scene.add(new THREE.GridHelper(400, 400, 0x1c3550, 0x152840));
 
-// ── Voxel / Point-cloud renderer ─────────────────────────────
-const MAX_V = 80000;
-const unitBox = new THREE.BoxGeometry(1, 1, 1);
-
-// Occupied cells → solid columns; MeshBasicMaterial = colors are lighting-independent
-const wallMesh = new THREE.InstancedMesh(
-  unitBox,
-  new THREE.MeshBasicMaterial({ vertexColors: true }),
-  MAX_V
-);
-wallMesh.count = 0;
-scene.add(wallMesh);
-
-// Soft circular sprite texture — makes points render as glowing spheres, not squares
+// ── Sprite texture for point clouds (lidar uses this) ─────────
 function makeSpriteTex() {
   const c = document.createElement('canvas');
   c.width = c.height = 64;
@@ -667,169 +869,86 @@ function makeSpriteTex() {
   return new THREE.CanvasTexture(c);
 }
 
-// Gradient / inflation zone → point cloud (see-through, no lighting needed)
-const gradGeo = new THREE.BufferGeometry();
-const gradPts = new THREE.Points(gradGeo, new THREE.PointsMaterial({
-  size: 0.13,
-  sizeAttenuation: true,
-  vertexColors: true,
-  transparent: true,
-  opacity: 0.92,
-  map: makeSpriteTex(),
-  alphaTest: 0.04,
-  depthWrite: false,
-}));
-scene.add(gradPts);
+let cameraFitted = false;
 
-const dummy = new THREE.Object3D();
-let lastV = -1, cameraFitted = false;
-
-// ── Color palettes ────────────────────────────────────────────
-// Gradient zone — 5-stop turbo-like: every stop is perceptually bright, no near-black
-const _GC = [
-  new THREE.Color(0x4040ff), // vivid blue       (lowest cost)
-  new THREE.Color(0x00d4ff), // cyan
-  new THREE.Color(0x39ff14), // neon green
-  new THREE.Color(0xffd000), // amber
-  new THREE.Color(0xff3300), // red-orange        (highest cost)
-];
-function gradColor(v) {
-  const t = Math.min(1, Math.max(0, (v - 5) / 84)) * (_GC.length - 1);
-  const i = Math.min(_GC.length - 2, Math.floor(t));
-  return new THREE.Color().lerpColors(_GC[i], _GC[i + 1], t - i);
-}
-
-// Wall zone — hot-white: clearly distinct from the point cloud, reads as "solid obstacle"
-const _WC = [
-  new THREE.Color(0xffee00), // yellow       (v=90, softest obstacle)
-  new THREE.Color(0xffffff), // white        (v=95)
-  new THREE.Color(0xff88cc), // pink-white   (v=100, hardest obstacle)
-];
-function wallColor(v) {
-  const t = Math.min(1, (v - 90) / 10) * (_WC.length - 1);
-  const i = Math.min(_WC.length - 2, Math.floor(t));
-  return new THREE.Color().lerpColors(_WC[i], _WC[i + 1], t - i);
-}
-
-function b64ToUint8(b64) {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
-
-function rebuildVoxels(cm) {
-  if (!cm || (!cm.flat && !cm.b64) || cm.v === lastV) return;
-  lastV = cm.v;
-  const flat = cm.b64 ? b64ToUint8(cm.b64) : cm.flat;
-  const shape = cm.shape || [0, 0];
-  const rows = shape[0], cols = shape[1];
-  if (!rows || !cols) return;
-  const res = cm.resolution || 0.05;
-  const oc = cm.origin || {};
-  const ox = oc.c ? oc.c[0] : 0;
-  const oy = oc.c ? oc.c[1] : 0;
-
-  let wc = 0;
-  const gPos = [], gCol = [];
-
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const v = flat[r * cols + c];
-      const wx = ox + (c + 0.5) * res;
-      const wy = oy + (r + 0.5) * res;
-
-      if (v >= 90 && v !== 255) {
-        // Solid column — height encodes occupancy strength (0.35 → 1.2 m)
-        if (wc < MAX_V) {
-          const h = 0.35 + (v - 90) * 0.085;
-          dummy.position.set(wx, h * 0.5, -wy);
-          dummy.scale.set(res, h, res);
-          dummy.updateMatrix();
-          wallMesh.setMatrixAt(wc, dummy.matrix);
-          wallMesh.setColorAt(wc, wallColor(v));
-          wc++;
-        }
-      } else if (v > 5 && v < 90) {
-        // Point cloud — height encodes cost (0.04 → 0.46 m), color viridis gradient
-        const h = 0.04 + (v / 89) * 0.42;
-        const col = gradColor(v);
-        gPos.push(wx, h, -wy);
-        gCol.push(col.r, col.g, col.b);
-      }
-    }
-  }
-
-  wallMesh.count = wc;
-  wallMesh.instanceMatrix.needsUpdate = true;
-  if (wallMesh.instanceColor) wallMesh.instanceColor.needsUpdate = true;
-
-  gradGeo.setAttribute('position', new THREE.Float32BufferAttribute(gPos, 3));
-  gradGeo.setAttribute('color',    new THREE.Float32BufferAttribute(gCol, 3));
-
-  if (!cameraFitted && (wc > 0 || gPos.length > 0)) {
-    cameraFitted = true;
-    const mx = ox + cols * res / 2;
-    const my = oy + rows * res / 2;
-    const span = Math.max(cols, rows) * res;
-    controls.target.set(mx, 0.3, -my);
-    camera.position.set(mx, span * 0.7, -my + span * 0.9);
-    controls.update();
-  }
-}
-
-// ── Robot ─────────────────────────────────────────────────────
+// ── Robot — procedural Go2-style quadruped ─────────────────────
+// Local axes: +X = forward (heading), +Y = up, +Z = right.
 const robotGrp = new THREE.Group();
 
-const body = new THREE.Mesh(
-  new THREE.SphereGeometry(0.18, 16, 12),
-  new THREE.MeshStandardMaterial({
-    color: 0x4fc3f7, emissive: 0x4fc3f7, emissiveIntensity: 0.5, roughness: 0.2
-  })
-);
+const matBody  = new THREE.MeshStandardMaterial({ color: 0x222831, roughness: 0.5, metalness: 0.4 });
+const matLight = new THREE.MeshStandardMaterial({ color: 0x4fc3f7, emissive: 0x4fc3f7, emissiveIntensity: 0.6 });
+const matLeg   = new THREE.MeshStandardMaterial({ color: 0x111418, roughness: 0.7 });
+
+// Body
+const body = new THREE.Mesh(new THREE.BoxGeometry(0.50, 0.16, 0.22), matBody);
+body.position.y = 0.0;
 robotGrp.add(body);
-
-const arrowMesh = new THREE.Mesh(
-  new THREE.ConeGeometry(0.07, 0.28, 8),
-  new THREE.MeshStandardMaterial({ color: 0x80d8ff, emissive: 0x4fc3f7, emissiveIntensity: 0.3 })
-);
-arrowMesh.rotation.z = -Math.PI / 2;
-arrowMesh.position.x = 0.27;
-robotGrp.add(arrowMesh);
-
+// Head/snout
+const head = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.12, 0.16), matBody);
+head.position.set(0.30, 0.04, 0.0);
+robotGrp.add(head);
+// Eyes (forward indicator + heading proxy)
+const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.025, 10, 8), matLight);
+eyeL.position.set(0.385, 0.06, 0.05); robotGrp.add(eyeL);
+const eyeR = new THREE.Mesh(new THREE.SphereGeometry(0.025, 10, 8), matLight);
+eyeR.position.set(0.385, 0.06, -0.05); robotGrp.add(eyeR);
+// Forward LED bar
+const led = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.015, 0.10), matLight);
+led.position.set(0.392, 0.02, 0.0); robotGrp.add(led);
+// Legs — 4 cylinders (front-left, front-right, back-left, back-right)
+function _addLeg(x, z) {
+  const g = new THREE.Group();
+  const upper = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.16, 8), matLeg);
+  upper.position.y = -0.16; g.add(upper);
+  const foot = new THREE.Mesh(new THREE.SphereGeometry(0.035, 10, 8), matLeg);
+  foot.position.y = -0.27; g.add(foot);
+  g.position.set(x, -0.08, z);
+  robotGrp.add(g);
+  return g;
+}
+const legFL = _addLeg( 0.20,  0.10);
+const legFR = _addLeg( 0.20, -0.10);
+const legBL = _addLeg(-0.20,  0.10);
+const legBR = _addLeg(-0.20, -0.10);
+// Soft glow ring underneath
 const ringMesh = new THREE.Mesh(
-  new THREE.RingGeometry(0.22, 0.32, 32),
-  new THREE.MeshBasicMaterial({ color: 0x4fc3f7, transparent: true, opacity: 0.28, side: THREE.DoubleSide })
+  new THREE.RingGeometry(0.32, 0.45, 36),
+  new THREE.MeshBasicMaterial({ color: 0x4fc3f7, transparent: true, opacity: 0.22, side: THREE.DoubleSide })
 );
 ringMesh.rotation.x = -Math.PI / 2;
+ringMesh.position.y = -0.30;
 robotGrp.add(ringMesh);
 
 robotGrp.visible = false;
 scene.add(robotGrp);
 
-let _robotX = 0, _robotY = 0;
+let _robotX = 0, _robotY = 0, _robotZ = 0;
+let _lastRobotX = 0, _lastRobotY = 0, _robotSpeed = 0;
 function updateRobot(rp) {
-  if (!rp || !rp.c) return;
-  _robotX = rp.c[0]; _robotY = rp.c[1];
-  const theta = rp.c[2] || 0;
-  robotGrp.rotation.y = -theta;
+  // rp = {x, y, z, yaw, pitch, roll, qx, qy, qz, qw, ts} from /pose/live
+  if (!rp || rp.x === undefined) return;
+  _lastRobotX = _robotX;
+  _lastRobotY = _robotY;
+  _robotX = rp.x;
+  _robotY = rp.y;
+  _robotZ = rp.z || 0;
+  _robotSpeed = Math.hypot(_robotX - _lastRobotX, _robotY - _lastRobotY);
+  // Three.js: world axes are X=east, Y=up, Z=south.  We use X=robot-X, Z=-robot-Y.
+  // Yaw rotation about world Y mirrors the robot's heading in the (x,y) plane.
+  const yaw = (rp.yaw !== undefined) ? rp.yaw : 0;
+  robotGrp.rotation.set(0, -yaw, 0);
   robotGrp.visible = true;
-  document.getElementById('robot-pos').textContent = '(' + _robotX.toFixed(2) + ', ' + _robotY.toFixed(2) + ')';
-}
-
-// ── Path ──────────────────────────────────────────────────────
-const pathGeo = new THREE.BufferGeometry();
-const pathLine = new THREE.Line(
-  pathGeo,
-  new THREE.LineBasicMaterial({ color: 0xce93d8, transparent: true, opacity: 0.85 })
-);
-scene.add(pathLine);
-
-function updatePath(pd) {
-  if (!pd || !pd.points || !pd.points.length) { pathGeo.setFromPoints([]); return; }
-  pathGeo.setFromPoints(pd.points.map(function(p) {
-    return new THREE.Vector3(p[0], 0.12, -p[1]);
-  }));
+  document.getElementById('robot-pos').textContent =
+    '(' + _robotX.toFixed(2) + ', ' + _robotY.toFixed(2) +
+    ') · ψ ' + (yaw * 180 / Math.PI).toFixed(0) + '°';
+  // First-time camera framing once we have a real pose
+  if (!cameraFitted) {
+    cameraFitted = true;
+    controls.target.set(_robotX, 0.3, -_robotY);
+    camera.position.set(_robotX + 4, 4, -_robotY + 4);
+    controls.update();
+  }
+  updateGoalLine();
 }
 
 // ── Semantic objects ──────────────────────────────────────────
@@ -878,13 +997,65 @@ function updateObjects(objs) {
   }).join('');
 }
 
+// ── Goal/path overlay ────────────────────────────────────────
+// DimOS is not currently publishing a planner path topic on LCM here. Until it
+// does, show the commanded route segment in amber from current pose to goal.
+const goalLineGeo = new THREE.BufferGeometry();
+const goalLine = new THREE.Line(
+  goalLineGeo,
+  new THREE.LineBasicMaterial({ color: 0xffb74d, transparent: true, opacity: 0.95 })
+);
+goalLine.visible = false;
+scene.add(goalLine);
+
+const goalMarker = new THREE.Mesh(
+  new THREE.RingGeometry(0.18, 0.28, 32),
+  new THREE.MeshBasicMaterial({ color: 0xffb74d, transparent: true, opacity: 0.9, side: THREE.DoubleSide })
+);
+goalMarker.rotation.x = -Math.PI / 2;
+goalMarker.visible = false;
+scene.add(goalMarker);
+
+let _activeGoal = null;
+function updateGoalLine() {
+  if (!_activeGoal) return;
+  const dist = Math.hypot(_activeGoal.x - _robotX, _activeGoal.y - _robotY);
+  if (dist < 0.25) {
+    _activeGoal = null;
+    goalLine.visible = false;
+    goalMarker.visible = false;
+    return;
+  }
+  goalLineGeo.setFromPoints([
+    new THREE.Vector3(_robotX, 0.08, -_robotY),
+    new THREE.Vector3(_activeGoal.x, 0.08, -_activeGoal.y),
+  ]);
+  goalMarker.position.set(_activeGoal.x, 0.04, -_activeGoal.y);
+  goalLine.visible = true;
+  goalMarker.visible = true;
+}
+
 // ── Click → navigate ──────────────────────────────────────────
 const ray = new THREE.Raycaster();
 const m2 = new THREE.Vector2();
 const navPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 const navPt = new THREE.Vector3();
 
-renderer.domElement.addEventListener('click', async function(e) {
+// Distinguish a true click (for nav goal) from a drag (for camera rotate).
+// Only fire when pointerup happens within ~5 px of pointerdown AND under 350 ms.
+let _downX = 0, _downY = 0, _downT = 0, _downBtn = -1;
+const CLICK_PX = 6;
+const CLICK_MS = 350;
+
+renderer.domElement.addEventListener('pointerdown', function(e) {
+  _downX = e.clientX; _downY = e.clientY; _downT = Date.now(); _downBtn = e.button;
+});
+renderer.domElement.addEventListener('pointerup', async function(e) {
+  if (_downBtn !== 0 || e.button !== 0) return;            // primary button only
+  const dx = e.clientX - _downX, dy = e.clientY - _downY;
+  const dist = Math.hypot(dx, dy);
+  const dt = Date.now() - _downT;
+  if (dist > CLICK_PX || dt > CLICK_MS) return;            // it was a drag, not a click
   const r = renderer.domElement.getBoundingClientRect();
   m2.x =  ((e.clientX - r.left) / r.width)  * 2 - 1;
   m2.y = -((e.clientY - r.top)  / r.height) * 2 + 1;
@@ -898,6 +1069,10 @@ renderer.domElement.addEventListener('click', async function(e) {
     _showNav(res.ok
       ? 'Goal sent (' + wx.toFixed(2) + ', ' + wy.toFixed(2) + ')'
       : 'Failed: ' + (d.detail || 'error'), !res.ok);
+    if (res.ok) {
+      _activeGoal = {x: wx, y: wy};
+      updateGoalLine();
+    }
   } catch(err) { _showNav('Error: ' + err.message, true); }
 });
 
@@ -975,21 +1150,30 @@ function updateLidar(data) {
   lidarGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   lidarGeo.setAttribute('color',    new THREE.Float32BufferAttribute(col, 3));
 
-  // When real LiDAR is flowing, hide the costmap gradient cloud (less clutter)
-  gradPts.visible = false;
+  // Frame the camera once on the first pointcloud arrival, if we don't have pose yet.
+  if (!cameraFitted) {
+    cameraFitted = true;
+    controls.target.set(_robotX, 0.3, -_robotY);
+    camera.position.set(_robotX + 4, 4, -_robotY + 4);
+    controls.update();
+  }
 }
 
-// ── Polling ───────────────────────────────────────────────────
-let lastTs = 0;
+// ── Polling — direct from MCP/dimos LCM (via cloud bridges) ──
+//
+//   /pose/live        — nav_bridge pushes from /odom @ ~15 Hz
+//   /pointcloud/live  — pc_bridge  pushes from /lidar @ ~2 Hz
+//   /map              — semantic objects from dimos_bridge / /ingest
+//
+let _lastPoseTs = 0;
 
-async function pollLive() {
+async function pollPose() {
   try {
-    const d = await (await fetch('/map/live')).json();
-    if (d.costmap) rebuildVoxels(d.costmap);
-    if (d.robot_pose) updateRobot(d.robot_pose);
-    if (d.path) updatePath(d.path);
-    if (d.timestamp && d.timestamp !== lastTs) {
-      lastTs = d.timestamp;
+    const d = await (await fetch('/pose/live')).json();
+    const entry = d['go2_a'] || Object.values(d)[0];
+    if (entry && entry.ts !== _lastPoseTs) {
+      _lastPoseTs = entry.ts;
+      updateRobot(entry);
       document.getElementById('conn-dot').classList.add('live');
     }
   } catch(e) {}
@@ -1010,17 +1194,22 @@ async function pollPointcloud() {
   } catch(e) {}
 }
 
-setInterval(pollLive,       500);
+// Pose at ~10 Hz so the marker tracks live; pointcloud at 4 Hz; objects at 0.5 Hz.
+setInterval(pollPose,       100);
+setInterval(pollPointcloud, 250);
 setInterval(pollSem,       2000);
-setInterval(pollPointcloud, 800);
-pollLive(); pollSem(); pollPointcloud();
+pollPose(); pollPointcloud(); pollSem();
 
-// ── Resize ────────────────────────────────────────────────────
-window.addEventListener('resize', function() {
-  camera.aspect = panel.clientWidth / panel.clientHeight;
+// ── Resize: ResizeObserver covers BOTH window resize AND sidebar drags ──
+function _fitRendererToPanel() {
+  const w = panel.clientWidth, h = panel.clientHeight;
+  if (!w || !h) return;
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(panel.clientWidth, panel.clientHeight);
-});
+  renderer.setSize(w, h, false);
+}
+window.addEventListener('resize', _fitRendererToPanel);
+new ResizeObserver(_fitRendererToPanel).observe(panel);
 
 // ── Render loop ───────────────────────────────────────────────
 (function animate() {
@@ -1029,9 +1218,15 @@ window.addEventListener('resize', function() {
 
   if (robotGrp.visible) {
     const t = Date.now() * 0.001;
-    robotGrp.position.set(_robotX, 0.22 + Math.sin(t * 2.1) * 0.05, -_robotY);
+    // Body height tuned to dog stance: ~0.30m above ground.
+    robotGrp.position.set(_robotX, 0.30, -_robotY);
     ringMesh.material.opacity = 0.18 + Math.sin(t * 2.8) * 0.12;
-    ringMesh.scale.setScalar(1.0 + Math.sin(t * 1.6) * 0.18);
+    ringMesh.scale.setScalar(1.0 + Math.sin(t * 1.6) * 0.10);
+    const moving = Math.min(1, _robotSpeed * 18);
+    const gait = Math.sin(t * 10) * 0.08 * moving;
+    legFL.rotation.z =  gait; legBR.rotation.z =  gait;
+    legFR.rotation.z = -gait; legBL.rotation.z = -gait;
+    goalMarker.rotation.z += 0.025;
   }
 
   renderer.render(scene, camera);
